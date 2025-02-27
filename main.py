@@ -27,7 +27,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     company_name: str
-    inn: str
+    inn: Optional[str] = None  # Теперь необязательный
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -51,7 +51,7 @@ class ProfileResponse(BaseModel):
 class UpdateProfileRequest(BaseModel):
     email: EmailStr | None = None
     company_name: str | None = None
-    inn: str | None = None
+    inn: Optional[constr(regex=r'^\d{10}$|^\d{12}$')] = None
 
 class ReportRequest(BaseModel):
     period: str
@@ -69,6 +69,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     try:
         return await auth_service.get_current_user(token)
     except AuthError as e:
+        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Header(...), db: Session = Depends(get_db)):
@@ -88,6 +89,7 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
         QueueService().send_notification(user_id, f"Добро пожаловать, {request.email}!")
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
     except AuthError as e:
+        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Ошибка регистрации: {str(e)}")
@@ -101,6 +103,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         user_id, token, refresh_token, csrf_token = await auth_service.login(request.email, request.password)
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token=csrf_token)
     except AuthError as e:
+        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.post("/logout", summary="Выход пользователя")
@@ -119,6 +122,7 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
         payload = auth_service._verify_token(refresh_token)
         return TokenResponse(user_id=payload["sub"], token=new_token, refresh_token=new_refresh_token, csrf_token="")
     except AuthError as e:
+        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.get("/profile", response_model=ProfileResponse, summary="Получение профиля")
@@ -129,9 +133,8 @@ async def get_profile(user_id_role: tuple = Depends(get_current_user), db: Sessi
     profile = await auth_service.get_profile(user_id)
     return ProfileResponse(**profile)
 
-@app.put("/profile", response_model=ProfileResponse, summary="Обновление профиля", dependencies=[Depends(verify_csrf)])
+@app.put("/profile", response_model=ProfileResponse, dependencies=[Depends(verify_csrf)])
 async def update_profile(request: UpdateProfileRequest, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Обновление информации профиля пользователя (требуется CSRF-токен)."""
     user_id, _ = user_id_role
     auth_service = AuthService(db)
     profile = await auth_service.update_profile(user_id, request.email, request.company_name, request.inn)
@@ -162,6 +165,22 @@ async def superadmin_stats(period: str, user_id_role: tuple = Depends(get_curren
     auth_service = AuthService(db)
     stats = await auth_service.superadmin_report(user_id, period)
     return stats
+
+@app.get("/auth/google", summary="Получить URL для Google OAuth")
+async def google_login(db: Session = Depends(get_db)):
+    auth_service = AuthService(db)
+    url = await auth_service.google_login_url()
+    return {"url": url}
+
+@app.get("/auth/google/callback", response_model=TokenResponse, summary="Callback для Google OAuth")
+async def google_callback(code: str, db: Session = Depends(get_db)):
+    auth_service = AuthService(db)
+    try:
+        user_id, token, refresh_token = await auth_service.google_callback(code)
+        return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
+    except AuthError as e:
+        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health", summary="Проверка состояния")
 def health_check():

@@ -12,6 +12,8 @@ from passlib.context import CryptContext
 import redis.asyncio as redis
 import asyncio
 import secrets
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 logger = logging.getLogger("auth-service")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -96,15 +98,14 @@ class AuthService:
         key = f"login_attempts:{email}"
         await self.redis.delete(key)
 
-    async def register(self, email: str, password: str, company_name: str, inn: str, role: str = "user") -> Tuple[str, str, str]:
-        """Регистрация нового пользователя и компании."""
+    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "user") -> Tuple[str, str, str]:
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Email уже зарегистрирован")
-        if self.db.query(Company).filter(Company.inn == inn).first():
+        if inn and self.db.query(Company).filter(Company.inn == inn).first():
             raise AuthError("ИНН уже используется")
 
         hashed_password = self._hash_password(password)
-        company = Company(name=company_name, inn=inn)
+        company = Company(name=company_name, inn=inn)  # inn теперь опционален
         self.db.add(company)
         self.db.flush()
         user = User(email=email, password_hash=hashed_password, company_id=company.company_id, role=role)
@@ -232,6 +233,71 @@ class AuthService:
         await self.redis.delete(f"profile:{user_id}")
         await self._log_audit(requester_id, f"User {user_id} deleted")
         logger.info(f"Пользователь {user_id} удален пользователем {requester_id}")
+
+    async def google_login_url(self) -> str:
+        """Генерирует URL для авторизации через Google."""
+        state = secrets.token_urlsafe(16)
+        await self.redis.set(f"oauth_state:{state}", "1", ex=600)
+        google_auth_url = (
+            "https://accounts.google.com/o/oauth2/v2/auth?"
+            f"client_id={Config.GOOGLE_CLIENT_ID}&"
+            f"redirect_uri={Config.GOOGLE_REDIRECT_URI}&"
+            "response_type=code&"
+            "scope=openid%20email%20profile"
+            f"state={state}"
+        )
+        return google_auth_url
+
+    async def google_callback(self, code: str, state: str) -> Tuple[str, str, str]:
+        """Обрабатывает callback от Google и возвращает токены."""
+        if not await self.redis.get(f"oauth_state:{state}"):
+            raise AuthError("Неверный или просроченный state")
+        token_url = "https://oauth2.googleapis.com/token"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                token_url,
+                data={
+                    "code": code,
+                    "client_id": Config.GOOGLE_CLIENT_ID,
+                    "client_secret": Config.GOOGLE_CLIENT_SECRET,
+                    "redirect_uri": Config.GOOGLE_REDIRECT_URI,
+                    "grant_type": "authorization_code",
+                }
+            ) as response:
+                token_data = await response.json()
+                if "id_token" not in token_data:
+                    raise AuthError("Ошибка получения токена от Google")
+
+        # Проверяем id_token и получаем email
+        id_info = id_token.verify_oauth2_token(
+            token_data["id_token"], google_requests.Request(), Config.GOOGLE_CLIENT_ID
+        )
+        email = id_info["email"]
+
+        # Проверяем, существует ли пользователь с этой почтой
+        user = self.db.query(User).filter(User.email == email).first()
+        if not user:
+            # Создаём нового пользователя с email из Google
+            company = Company(name=f"Google User {email.split('@')[0]}")
+            self.db.add(company)
+            self.db.flush()
+            user = User(
+                email=email,  # Сохраняем почту из Google
+                password_hash="",  # Пустой хэш для Google-пользователей
+                company_id=company.company_id,
+                role="user"
+            )
+            self.db.add(user)
+            self.db.commit()
+            logger.info(f"Создан новый пользователь через Google: {email}")
+        else:
+            logger.info(f"Существующий пользователь вошел через Google: {email}")
+
+        user_id = str(user.user_id)
+        token = self._generate_token(user_id, user.role, Config.JWT_EXPIRY)
+        refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
+        await self._log_audit(user_id, "Google login")
+        return user_id, token, refresh_token
 
     async def superadmin_report(self, requester_id: str, period: str) -> Dict:
         """Генерация отчета для SuperAdmin."""

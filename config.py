@@ -13,3 +13,6 @@ class Config:
     JWT_ROTATION_INTERVAL = 86400
     MAX_LOGIN_ATTEMPTS = 5
     LOCKOUT_DURATION = 900
+    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "your-google-client-id")
+    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "your-google-client-secret")
+    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")

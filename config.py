@@ -1,7 +1,7 @@
 import os
 
 class Config:
-    DB_URL = os.getenv("DB_URL", "postgresql://postres:mysecretpassword@localhost:5432/auth_shard_0")
+    DB_URL = os.getenv("DB_URL", "postgresql://postres:mysecretpassword@localhost:5432/postgres")
     REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
     SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")

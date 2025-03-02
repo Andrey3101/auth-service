@@ -6,7 +6,7 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      DB_URL: postgresql://user:password@postgres:5432/tasks
+      DB_URL: postgresql://postgres:mysecretpassword@host.docker.internal:5432/postgres
       REDIS_URL: redis://redis:6379/0
       RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
       GOOGLE_CLIENT_ID: your-google-client-id
@@ -22,16 +22,6 @@ services:
     networks:
       - app-network
 
-  postgres:
-    image: postgres:15
-    environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: tasks
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    networks:
-      - app-network
 
   redis:
     image: redis:6

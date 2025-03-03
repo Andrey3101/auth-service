@@ -98,14 +98,14 @@ class AuthService:
         key = f"login_attempts:{email}"
         await self.redis.delete(key)
 
-    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "user") -> Tuple[str, str, str]:
+    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "admin") -> Tuple[str, str, str]:
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Email уже зарегистрирован")
         if inn and self.db.query(Company).filter(Company.inn == inn).first():
             raise AuthError("ИНН уже используется")
 
         hashed_password = self._hash_password(password)
-        company = Company(name=company_name, inn=inn)  # inn теперь опционален
+        company = Company(name=company_name, inn=inn)
         self.db.add(company)
         self.db.flush()
         user = User(email=email, password_hash=hashed_password, company_id=company.company_id, role=role)

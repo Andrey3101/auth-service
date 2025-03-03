@@ -2,12 +2,14 @@ from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
 from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 from config import Config
 from services.auth_service import AuthService, AuthError
 from services.queue_service import QueueService
 from models import Base
 import logging
+from typing import Optional
+
 
 logger = logging.getLogger("auth-service")
 logging.basicConfig(level=logging.INFO)
@@ -27,7 +29,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     company_name: str
-    inn: Optional[str] = None  # Теперь необязательный
+    inn: Optional[str] = None
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -49,9 +51,9 @@ class ProfileResponse(BaseModel):
     tasks_endpoint: str | None = None
 
 class UpdateProfileRequest(BaseModel):
-    email: EmailStr | None = None
-    company_name: str | None = None
-    inn: Optional[constr(regex=r'^\d{10}$|^\d{12}$')] = None
+    email: EmailStr
+    company_name: str
+    inn: Optional[str] = Field(default=None, pattern=r'^\d{10}$|^\d{12}$')
 
 class ReportRequest(BaseModel):
     period: str
@@ -69,7 +71,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     try:
         return await auth_service.get_current_user(token)
     except AuthError as e:
-        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
+        logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Header(...), db: Session = Depends(get_db)):
@@ -103,7 +105,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         user_id, token, refresh_token, csrf_token = await auth_service.login(request.email, request.password)
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token=csrf_token)
     except AuthError as e:
-        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
+        logger.error(f"Ошибка входа: {user_id}: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.post("/logout", summary="Выход пользователя")
@@ -122,7 +124,7 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
         payload = auth_service._verify_token(refresh_token)
         return TokenResponse(user_id=payload["sub"], token=new_token, refresh_token=new_refresh_token, csrf_token="")
     except AuthError as e:
-        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
+        logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.get("/profile", response_model=ProfileResponse, summary="Получение профиля")
@@ -135,26 +137,38 @@ async def get_profile(user_id_role: tuple = Depends(get_current_user), db: Sessi
 
 @app.put("/profile", response_model=ProfileResponse, dependencies=[Depends(verify_csrf)])
 async def update_profile(request: UpdateProfileRequest, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    user_id, _ = user_id_role
-    auth_service = AuthService(db)
-    profile = await auth_service.update_profile(user_id, request.email, request.company_name, request.inn)
-    return ProfileResponse(**profile)
+    try:
+        user_id, _ = user_id_role
+        auth_service = AuthService(db)
+        profile = await auth_service.update_profile(user_id, request.email, request.company_name, request.inn)
+        return ProfileResponse(**profile)
+    except AuthError as e:
+        logger.error(f"Ошибка обновления профиля {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.delete("/users/{user_id}", summary="Удаление пользователя")
 async def delete_user(user_id: str, requester_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
     """Удаление пользователя (только для admin или super_admin)."""
-    requester_id, _ = requester_id_role
-    auth_service = AuthService(db)
-    await auth_service.delete_user(user_id, requester_id)
-    return {"message": "Пользователь успешно удален"}
+    try:
+        requester_id, _ = requester_id_role
+        auth_service = AuthService(db)
+        await auth_service.delete_user(user_id, requester_id)
+        return {"message": "Пользователь успешно удален"}
+    except AuthError as e:
+        logger.error("Ошибка при удалении профиля")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/report", summary="Генерация отчета")
 async def generate_report(request: ReportRequest, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
     """Генерация отчета о регистрации (только super_admin, устаревший метод)."""
-    user_id, _ = user_id_role
-    auth_service = AuthService(db)
-    report = auth_service.generate_report(user_id, request.period)
-    return report
+    try:
+        user_id, _ = user_id_role
+        auth_service = AuthService(db)
+        report = auth_service.generate_report(user_id, request.period)
+        return report
+    except AuthError as e:
+        logger.error("Ошибка при генерации отчета")
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/superadmin/stats", summary="Статистика для SuperAdmin")
 async def superadmin_stats(period: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):

@@ -6,30 +6,38 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      DB_URL: postgresql://postgres:mysecretpassword@host.docker.internal:5432/postgres
-      REDIS_URL: redis://redis:6379/0
-      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/
-      GOOGLE_CLIENT_ID: your-google-client-id
-      GOOGLE_CLIENT_SECRET: your-google-client-secret
-      GOOGLE_REDIRECT_URI: http://localhost:8000/auth/google/callback
-      JWT_SECRET: your-secret-key
+      - DB_URL=postgresql://postgres:mysecretpassword@host.docker.internal:5432/postgres
+      - REDIS_URL=redis://redis:6379/0
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - GOOGLE_CLIENT_ID=your-google-client-id
+      - GOOGLE_CLIENT_SECRET=your-google-client-secret
+      - GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
+      - JWT_SECRET=your-secret-key
     ports:
       - "8000:8000"
     depends_on:
-      - postgres
       - redis
       - rabbitmq
     networks:
       - app-network
 
-
   redis:
     image: redis:6
+    ports:
+      - "6379:6379"  # Открываем порт для доступа с хоста (опционально)
     networks:
       - app-network
 
   rabbitmq:
     image: rabbitmq:3-management
+    ports:
+      - "5673:5673"   # Основной порт RabbitMQ
+      - "15673:15673" # Веб-интерфейс управления
+    healthcheck:
+      test: ["CMD", "rabbitmqctl", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
     networks:
       - app-network
 
@@ -37,5 +45,4 @@ networks:
   app-network:
     driver: bridge
 
-volumes:
-  postgres_data:
+# Удаляем volumes, так как postgres_data не используется

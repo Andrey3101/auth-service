@@ -17,8 +17,8 @@
   - Redis для кэширования профилей и черного списка токенов
   - RabbitMQ для отправки уведомлений
 - **Структура БД**:
-  - `auth.companies`: `company_id (UUID PK), name (String), inn (String UNIQUE), created_at (DateTime)`
-  - `auth.users`: `user_id (UUID PK), email (String UNIQUE), password_hash (String), company_id (UUID FK), role (String: super_admin/admin/user), created_at (DateTime)`
+  - `companies`: `company_id (UUID PK), name (String), inn (String UNIQUE), created_at (DateTime)`
+  - `users`: `user_id (UUID PK), email (String UNIQUE), password_hash (String), company_id (UUID FK), role (String: super_admin/admin/user), created_at (DateTime)`
 
 ## Запуск
 1. Установите зависимости: `pip install -r requirements.txt`

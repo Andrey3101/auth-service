@@ -30,6 +30,7 @@ class AuthService:
         self.rotation_interval = Config.JWT_ROTATION_INTERVAL
         self.max_login_attempts = Config.MAX_LOGIN_ATTEMPTS
         self.lockout_duration = Config.LOCKOUT_DURATION
+        self.queue = QueueService()
         asyncio.create_task(self.rotate_keys_periodically())
 
     async def rotate_keys_periodically(self):
@@ -38,8 +39,7 @@ class AuthService:
             await asyncio.sleep(self.rotation_interval)
             self.old_secret = self.current_secret
             self.current_secret = hashlib.sha256(f"{datetime.utcnow()}{Config.JWT_SECRET}".encode()).hexdigest()
-            logger.info("JWT_SECRET rotated")
-            await self.redis.set("jwt_old_secret", self.old_secret, ex=self.rotation_interval * 2)
+            await self.notify_user("all", "email", "JWT secret rotated, please re-login within 1 hour", priority=5)
 
     def _hash_password(self, password: str) -> str:
         return pwd_context.hash(password)
@@ -69,9 +69,15 @@ class AuthService:
                     raise AuthError("Неверный или просроченный токен")
             raise AuthError("Неверный или просроченный токен")
 
-    async def _log_audit(self, user_id: str, action: str):
+    async def _log_audit(self, user_id: str, action: str, ip: str = None, user_agent: str = None):
         """Логирование действий пользователя."""
-        audit_log = AuditLog(user_id=user_id, action=action, timestamp=datetime.utcnow())
+        audit_log = AuditLog(
+            user_id=user_id, 
+            action=action, 
+            timestamp=datetime.utcnow(), 
+            ip=ip, 
+            user_agent=user_agent
+        )
         self.db.add(audit_log)
         self.db.commit()
 
@@ -98,27 +104,18 @@ class AuthService:
         key = f"login_attempts:{email}"
         await self.redis.delete(key)
 
-    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "admin") -> Tuple[str, str, str]:
-        if self.db.query(User).filter(User.email == email).first():
-            raise AuthError("Email уже зарегистрирован")
-        if inn and self.db.query(Company).filter(Company.inn == inn).first():
-            raise AuthError("ИНН уже используется")
+    async def notify_user(self, user_id: str, channel: str, message: str, priority: int = 1):
+        async with self.session.post(
+            f"{Config.NOTIFICATION_SERVICE_URL}/notifications/send",
+            json={"user_id": user_id, "channel": channel, "message": message, "priority": priority},
+            headers={"Authorization": f"Bearer {self._generate_service_token()}"}
+        ) as resp:
+            if resp.status != 200:
+                logger.error(f"Failed to send notification: {await resp.text()}")
 
-        hashed_password = self._hash_password(password)
-        company = Company(name=company_name, inn=inn)
-        self.db.add(company)
-        self.db.flush()
-        user = User(email=email, password_hash=hashed_password, company_id=company.company_id, role=role)
-        self.db.add(user)
-        self.db.commit()
-
-        user_id = str(user.user_id)
-        token = self._generate_token(user_id, user.role, Config.JWT_EXPIRY)
-        refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
-        profile = {"user_id": user_id, "email": email, "company_name": company_name, "inn": inn, "role": role}
-        await self._cache_profile(user_id, profile)
-        await self._log_audit(user_id, f"User registered with role {role}")
-        logger.info(f"Пользователь зарегистрирован: {email}, роль: {role}")
+    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "user"):
+        user_id, token, refresh_token = await super().register(email, password, company_name, inn, role)
+        await notifications_service.send_verification_code(user_id, email)
         return user_id, token, refresh_token
 
     async def login(self, email: str, password: str) -> Tuple[str, str, str, str]:
@@ -186,11 +183,8 @@ class AuthService:
             "role": user.role,
             "editable": user.role == "admin"
         }
-        if user.role == "user":
-            profile.pop("company_name")
-            profile.pop("inn")
-            profile["tasks_endpoint"] = "/tasks/my"
-        await self._cache_profile(user_id, profile)
+        ttl = 3600 if user.role == "user" else 300
+        await self._cache_profile(user_id, profile, ttl)
         return profile
 
     async def update_profile(self, user_id: str, email: Optional[str] = None, company_name: Optional[str] = None, inn: Optional[str] = None) -> Dict:
@@ -366,6 +360,15 @@ class AuthService:
             raise AuthError("Токен в черном списке")
         payload = self._verify_token(token)
         return payload["sub"], payload["role"]
+    
+    async def request_password_reset(self, email: str):
+        user = self.db.query(User).filter(User.email == email).first()
+        if not user:
+            raise AuthError("User not found")
+        reset_token = secrets.token_urlsafe(32)
+        await self.redis.set(f"reset:{reset_token}", user.user_id, ex=3600)
+        await self.queue.send_notification(user.user_id, f"Reset link: {Config.APP_URL}/reset-password/confirm?token={reset_token}")
+        return {"message": "Reset link sent"}
 
     async def close(self) -> None:
         """Закрытие соединения с Redis."""

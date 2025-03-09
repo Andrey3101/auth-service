@@ -169,6 +169,15 @@ async def generate_report(request: ReportRequest, user_id_role: tuple = Depends(
     except AuthError as e:
         logger.error("Ошибка при генерации отчета")
         raise HTTPException(status_code=400, detail=str(e))
+    
+@app.get("/users", summary="Получение списка пользователей")
+async def get_users(db: Session = Depends(get_db), user_id_role: tuple = Depends(get_current_user)):
+    user_id, role = user_id_role
+    if role not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
+    auth_service = AuthService(db)
+    users = db.query(User).all()
+    return [{"user_id": str(u.user_id), "email": u.email, "role": u.role} for u in users]
 
 @app.get("/superadmin/stats", summary="Статистика для SuperAdmin")
 async def superadmin_stats(period: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):

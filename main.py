@@ -58,6 +58,16 @@ class UpdateProfileRequest(BaseModel):
 class ReportRequest(BaseModel):
     period: str
 
+class DeleteCompanyRequest(BaseModel):
+    company_id: str
+
+class PasswordResetRequest(BaseModel):
+    email: EmailStr
+
+class PasswordResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
 def get_db():
     db = SessionLocal()
     try:
@@ -204,6 +214,55 @@ async def google_callback(code: str, db: Session = Depends(get_db)):
     except AuthError as e:
         logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
+    
+@app.delete("/companies/{company_id}", summary="Удаление компании")
+async def delete_company(company_id: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
+    """
+    Удаление компании по company_id.
+    Только для пользователей с ролью admin или super_admin.
+    """
+    try:
+        user_id, role = user_id_role
+        if role not in ["admin", "super_admin"]:
+            raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
+
+        auth_service = AuthService(db)
+        await auth_service.delete_company(user_id, company_id)  # Вызов метода из AuthService
+        return {"message": "Компания успешно удалена"}
+    except AuthError as e:
+        logger.error(f"Ошибка при удалении компании {company_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при удалении компании {company_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Не удалось удалить компанию")
+    
+@app.post("/reset-password", summary="Запрос на сброс пароля")
+async def reset_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
+    """Запрос на сброс пароля с отправкой ссылки на email."""
+    auth_service = AuthService(db)
+    try:
+        result = await auth_service.request_password_reset(request.email)
+        return result
+    except AuthError as e:
+        logger.error(f"Ошибка при запросе сброса пароля для {request.email}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при запросе сброса пароля: {str(e)}")
+        raise HTTPException(status_code=500, detail="Не удалось обработать запрос на сброс пароля")
+    
+@app.post("/reset-password/confirm", summary="Подтверждение сброса пароля")
+async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
+    """Подтверждение сброса пароля с использованием токена и нового пароля."""
+    auth_service = AuthService(db)
+    try:
+        result = await auth_service.confirm_password_reset(request.token, request.new_password)
+        return result
+    except AuthError as e:
+        logger.error(f"Ошибка при подтверждении сброса пароля: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при подтверждении сброса пароля: {str(e)}")
+        raise HTTPException(status_code=500, detail="Не удалось сбросить пароль")
 
 @app.get("/health", summary="Проверка состояния")
 def health_check():

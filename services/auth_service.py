@@ -354,12 +354,74 @@ class AuthService:
     async def _cache_profile(self, user_id: str, profile: Dict, ttl: int = 600) -> None:
         await self.redis.set(f"profile:{user_id}", json.dumps(profile), ex=ttl)
 
+    async def delete_company(self, user_id: str, company_id: str):
+        """Удаление компании по company_id."""
+        # Получаем пользователя и проверяем его роль
+        user = self.db.query(User).filter_by(user_id=user_id).first()
+        if not user or user.role not in ["admin", "super_admin"]:
+            raise AuthError("Недостаточно прав для удаления компании")
+
+        # Находим компанию по company_id
+        company = self.db.query(Company).filter_by(company_id=company_id).first()
+        if not company:
+            raise AuthError("Компания не найдена")
+
+        # Удаляем компанию
+        self.db.delete(company)
+        self.db.commit()
+
+        logger.info(f"Компания {company_id} успешно удалена пользователем {user_id}")
+
     async def get_current_user(self, token: str) -> Tuple[str, str]:
         """Получение текущего пользователя из токена с проверкой черного списка."""
         if await self.redis.get(f"blacklist:{token}"):
             raise AuthError("Токен в черном списке")
         payload = self._verify_token(token)
         return payload["sub"], payload["role"]
+    
+    async def request_password_reset(self, email: str):
+        """Запрос на сброс пароля с генерацией токена и отправкой ссылки на email."""
+        user = self.db.query(User).filter(User.email == email).first()
+        if not user:
+            logger.warning(f"Попытка сброса пароля для несуществующего email: {email}")
+            raise AuthError("Пользователь с таким email не найден")
+        
+        reset_token = secrets.token_urlsafe(32)
+        await self.redis.set(f"reset:{reset_token}", user.user_id, ex=3600)  # Токен действителен 1 час
+        reset_link = f"{Config.APP_URL}/reset-password/confirm?token={reset_token}"
+        
+        # Отправка уведомления через QueueService
+        await self.queue.send_notification(
+            user.user_id,
+            f"Для сброса пароля перейдите по ссылке: {reset_link}"
+        )
+        
+        await self._log_audit(user.user_id, f"Password reset requested for {email}")
+        logger.info(f"Запрос на сброс пароля отправлен для {email}")
+        return {"message": "Ссылка для сброса пароля отправлена на ваш email"}
+
+    async def confirm_password_reset(self, reset_token: str, new_password: str) -> Dict:
+        """Подтверждение сброса пароля с использованием токена."""
+        user_id = await self.redis.get(f"reset:{reset_token}")
+        if not user_id:
+            logger.warning(f"Попытка сброса пароля с неверным или просроченным токеном: {reset_token}")
+            raise AuthError("Неверный или просроченный токен сброса пароля")
+
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user:
+            logger.error(f"Пользователь с ID {user_id} не найден при сбросе пароля")
+            raise AuthError("Пользователь не найден")
+
+        # Обновляем пароль
+        user.password_hash = self._hash_password(new_password)
+        self.db.commit()
+
+        # Удаляем токен из Redis после использования
+        await self.redis.delete(f"reset:{reset_token}")
+        
+        await self._log_audit(user_id, "Password reset completed")
+        logger.info(f"Пароль успешно сброшен для пользователя {user.email}")
+        return {"message": "Пароль успешно изменен"}
     
     async def request_password_reset(self, email: str):
         user = self.db.query(User).filter(User.email == email).first()

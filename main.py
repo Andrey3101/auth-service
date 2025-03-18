@@ -101,7 +101,7 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
         QueueService().send_notification(user_id, f"Добро пожаловать, {request.email}!")
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
     except AuthError as e:
-        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
+        logger.error(f"Ошибка при регистрации: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Ошибка регистрации: {str(e)}")
@@ -138,11 +138,14 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.get("/profile", response_model=ProfileResponse, summary="Получение профиля")
-async def get_profile(user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Получение данных профиля текущего пользователя."""
+async def get_profile(
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(default=None, alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
     user_id, _ = user_id_role
     auth_service = AuthService(db)
-    profile = await auth_service.get_profile(user_id)
+    profile = await auth_service.get_profile(user_id, csrf_token)
     return ProfileResponse(**profile)
 
 @app.put("/profile", response_model=ProfileResponse, dependencies=[Depends(verify_csrf)])
@@ -214,16 +217,6 @@ async def google_login(db: Session = Depends(get_db)):
     auth_service = AuthService(db)
     url = await auth_service.google_login_url()
     return {"url": url}
-
-@app.get("/auth/google/callback", response_model=TokenResponse, summary="Callback для Google OAuth")
-async def google_callback(code: str, db: Session = Depends(get_db)):
-    auth_service = AuthService(db)
-    try:
-        user_id, token, refresh_token = await auth_service.google_callback(code)
-        return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
-    except AuthError as e:
-        logger.error(f"Ошибка обновления профиля для {user_id}: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
     
 @app.delete("/companies/{company_id}", summary="Удаление компании")
 async def delete_company(company_id: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
@@ -278,3 +271,10 @@ async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Sessi
 def health_check():
     """Проверка работоспособности сервиса."""
     return {"status": "healthy"}
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    auth_service = AuthService(SessionLocal())
+    await auth_service.close()
+    queue_service = QueueService()
+    queue_service.close()

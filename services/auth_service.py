@@ -37,7 +37,7 @@ class AuthService:
 
     def _generate_service_token(self) -> str:
         return self._generate_token("service", "service", Config.JWT_EXPIRY)
-
+    
     async def rotate_keys_periodically(self):
         """Периодическая смена JWT_SECRET."""
         while True:
@@ -189,8 +189,10 @@ class AuthService:
             logger.error(f"Неверный refresh token: {str(e)}")
             raise AuthError("Неверный refresh token")
 
-    async def get_profile(self, user_id: str) -> Dict:
-        """Получение профиля пользователя."""
+    async def get_profile(self, user_id: str, csrf_token: Optional[str] = None) -> Dict:
+        if csrf_token:
+            if not await self.verify_csrf_token(user_id, csrf_token):
+                raise AuthError("Неверный CSRF-токен")
         cached_profile = await self.redis.get(f"profile:{user_id}")
         if cached_profile:
             logger.info(f"Профиль получен из кэша для {user_id}")

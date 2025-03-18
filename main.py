@@ -199,6 +199,16 @@ async def superadmin_stats(period: str, user_id_role: tuple = Depends(get_curren
     stats = await auth_service.superadmin_report(user_id, period)
     return stats
 
+@app.get("/auth/google/callback", response_model=TokenResponse, summary="Callback для Google OAuth")
+async def google_callback(code: str, state: str, db: Session = Depends(get_db)):
+    auth_service = AuthService(db)
+    try:
+        user_id, token, refresh_token = await auth_service.google_callback(code, state)
+        return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
+    except AuthError as e:
+        logger.error(f"Ошибка в Google callback: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/auth/google", summary="Получить URL для Google OAuth")
 async def google_login(db: Session = Depends(get_db)):
     auth_service = AuthService(db)

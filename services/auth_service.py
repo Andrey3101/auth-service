@@ -14,6 +14,8 @@ import asyncio
 import secrets
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
+from services.queue_service import QueueService
+import aiohttp
 
 logger = logging.getLogger("auth-service")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -33,13 +35,21 @@ class AuthService:
         self.queue = QueueService()
         asyncio.create_task(self.rotate_keys_periodically())
 
+    def _generate_service_token(self) -> str:
+        return self._generate_token("service", "service", Config.JWT_EXPIRY)
+
     async def rotate_keys_periodically(self):
         """Периодическая смена JWT_SECRET."""
         while True:
-            await asyncio.sleep(self.rotation_interval)
-            self.old_secret = self.current_secret
-            self.current_secret = hashlib.sha256(f"{datetime.utcnow()}{Config.JWT_SECRET}".encode()).hexdigest()
-            await self.notify_user("all", "email", "JWT secret rotated, please re-login within 1 hour", priority=5)
+            try:
+                await asyncio.sleep(self.rotation_interval)
+                self.old_secret = self.current_secret
+                self.current_secret = hashlib.sha256(f"{datetime.utcnow()}{Config.JWT_SECRET}".encode()).hexdigest()
+                await self.notify_user("all", "email", "JWT secret rotated, please re-login within 1 hour", priority=5)
+            except Exception as e:
+                logger.error(f"Ошибка при ротации ключей: {str(e)}")
+                await asyncio.sleep(60)  # Задержка перед повторной попыткой
+                
 
     def _hash_password(self, password: str) -> str:
         return pwd_context.hash(password)
@@ -105,17 +115,33 @@ class AuthService:
         await self.redis.delete(key)
 
     async def notify_user(self, user_id: str, channel: str, message: str, priority: int = 1):
-        async with self.session.post(
-            f"{Config.NOTIFICATION_SERVICE_URL}/notifications/send",
-            json={"user_id": user_id, "channel": channel, "message": message, "priority": priority},
-            headers={"Authorization": f"Bearer {self._generate_service_token()}"}
-        ) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to send notification: {await resp.text()}")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{Config.NOTIFICATION_SERVICE_URL}/notifications/send",
+                json={"user_id": user_id, "channel": channel, "message": message, "priority": priority},
+                headers={"Authorization": f"Bearer {self._generate_service_token()}"}
+            ) as resp:
+                if resp.status != 200:
+                    logger.error(f"Failed to send notification: {await resp.text()}")
 
     async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "user"):
-        user_id, token, refresh_token = await super().register(email, password, company_name, inn, role)
-        await notifications_service.send_verification_code(user_id, email)
+        # Создание компании
+        company = Company(name=company_name, inn=inn)
+        self.db.add(company)
+        self.db.flush()  # Получаем company_id
+        # Создание пользователя
+        user = User(
+            email=email,
+            password_hash=self._hash_password(password),
+            company_id=company.company_id,
+            role=role
+        )
+        self.db.add(user)
+        self.db.commit()
+        user_id = str(user.user_id)
+        token = self._generate_token(user_id, role, Config.JWT_EXPIRY)
+        refresh_token = self._generate_token(user_id, role, Config.REFRESH_TOKEN_EXPIRY)
+        await self.queue.send_notification(user_id, f"Ваш код верификации: {secrets.token_hex(3)}")
         return user_id, token, refresh_token
 
     async def login(self, email: str, password: str) -> Tuple[str, str, str, str]:
@@ -422,15 +448,7 @@ class AuthService:
         await self._log_audit(user_id, "Password reset completed")
         logger.info(f"Пароль успешно сброшен для пользователя {user.email}")
         return {"message": "Пароль успешно изменен"}
-    
-    async def request_password_reset(self, email: str):
-        user = self.db.query(User).filter(User.email == email).first()
-        if not user:
-            raise AuthError("User not found")
-        reset_token = secrets.token_urlsafe(32)
-        await self.redis.set(f"reset:{reset_token}", user.user_id, ex=3600)
-        await self.queue.send_notification(user.user_id, f"Reset link: {Config.APP_URL}/reset-password/confirm?token={reset_token}")
-        return {"message": "Reset link sent"}
+
 
     async def close(self) -> None:
         """Закрытие соединения с Redis."""

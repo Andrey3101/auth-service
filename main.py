@@ -8,7 +8,9 @@ from services.auth_service import AuthService, AuthError
 from services.queue_service import QueueService
 from models import Base
 import logging
-from typing import Optional
+from typing import Optional, Dict
+import aio_pika
+import asyncio
 
 
 logger = logging.getLogger("auth-service")
@@ -28,8 +30,8 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
-    company_name: str
-    inn: Optional[str] = None
+    company_type: str = Field(..., regex="^(self_employed|ip|ooo)$")  # Ограничение на допустимые значения
+    company_data: Dict  # Данные компании в зависимости от типа
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -94,10 +96,14 @@ async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Hea
 
 @app.post("/register", response_model=TokenResponse, summary="Регистрация пользователя")
 async def register(request: RegisterRequest, db: Session = Depends(get_db)):
-    """Регистрация нового пользователя и компании."""
     auth_service = AuthService(db)
     try:
-        user_id, token, refresh_token = await auth_service.register(request.email, request.password, request.company_name, request.inn)
+        user_id, token, refresh_token = await auth_service.register(
+            request.email,
+            request.password,
+            request.company_type,
+            request.company_data
+        )
         QueueService().send_notification(user_id, f"Добро пожаловать, {request.email}!")
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
     except AuthError as e:
@@ -136,6 +142,134 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
     except AuthError as e:
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
+
+@app.post("/time/start", summary="Начать трекинг времени")
+async def start_time_tracking(
+    task_id: str,
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "start_time_tracking",
+                    "data": {"user_id": user_id, "task_id": task_id}
+                }).encode()
+            ),
+            routing_key="task_queue"
+        )
+    return {"message": "Трекинг времени начат"}
+
+@app.post("/time/stop", summary="Остановить трекинг времени")
+async def stop_time_tracking(
+    entry_id: str,
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "stop_time_tracking",
+                    "data": {"user_id": user_id, "entry_id": entry_id}
+                }).encode()
+            ),
+            routing_key="task_queue"
+        )
+    return {"message": "Трекинг времени остановлен"}
+
+@app.post("/payroll/calculate", summary="Рассчитать зарплату")
+async def calculate_payroll(
+    period: str,
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "calculate_payroll",
+                    "data": {"user_id": user_id, "period": period}
+                }).encode()
+            ),
+            routing_key="task_queue"
+        )
+    return {"message": "Расчет зарплаты запущен"}
+
+@app.post("/leave/request", summary="Запрос на отпуск/больничный")
+async def request_leave(
+    leave_type: str,
+    start_date: str,
+    end_date: str,
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "create_leave_request",
+                    "data": {
+                        "user_id": user_id,
+                        "leave_type": leave_type,
+                        "start_date": start_date,
+                        "end_date": end_date
+                    }
+                }).encode()
+            ),
+            routing_key="task_queue"
+        )
+    return {"message": f"Запрос на {leave_type} отправлен"}
+
+@app.post("/competitors/monitor", summary="Мониторинг конкурентов")
+async def monitor_competitors(
+    urls: list[str],
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "monitor_competitors",
+                    "data": {"user_id": user_id, "urls": urls}
+                }).encode()
+            ),
+            routing_key="ai_queue"
+        )
+    return {"message": "Мониторинг конкурентов запущен"}
+
+@app.post("/promotion/recommendations", summary="Рекомендации по продвижению")
+async def get_promotion_recommendations(
+    sales_data: dict,
+    competitor_data: dict,
+    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    db: Session = Depends(get_db)
+):
+    user_id = token_data["user_id"]
+    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        channel = await connection.channel()
+        await channel.default_exchange.publish(
+            aio_pika.Message(
+                body=json.dumps({
+                    "type": "promotion_recommendations",
+                    "data": {"user_id": user_id, "sales_data": sales_data, "competitor_data": competitor_data}
+                }).encode()
+            ),
+            routing_key="ai_queue"
+        )
+    return {"message": "Запрос на рекомендации отправлен"}
 
 @app.get("/profile", response_model=ProfileResponse, summary="Получение профиля")
 async def get_profile(
@@ -278,3 +412,12 @@ async def shutdown_event():
     await auth_service.close()
     queue_service = QueueService()
     queue_service.close()
+
+@app.on_event("startup")
+async def startup_event():
+    service = AuthService(db=None)
+    asyncio.create_task(service.rotate_keys_periodically())
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

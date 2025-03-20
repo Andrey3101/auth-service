@@ -16,6 +16,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from services.queue_service import QueueService
 import aiohttp
+import aio_pika
 
 logger = logging.getLogger("auth-service")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -34,21 +35,25 @@ class AuthService:
         self.lockout_duration = Config.LOCKOUT_DURATION
         self.queue = QueueService()
         asyncio.create_task(self.rotate_keys_periodically())
+        self.secret_rotation_window = 3600
 
     def _generate_service_token(self) -> str:
         return self._generate_token("service", "service", Config.JWT_EXPIRY)
     
     async def rotate_keys_periodically(self):
-        """Периодическая смена JWT_SECRET."""
+        """Периодическая смена JWT_SECRET с уведомлением за час."""
         while True:
             try:
-                await asyncio.sleep(self.rotation_interval)
+                await asyncio.sleep(self.rotation_interval - self.secret_rotation_window)
+                await self.notify_user("all", "email", "JWT secret will rotate in 1 hour, please prepare to re-login", priority=5)
+                
+                await asyncio.sleep(self.secret_rotation_window)
                 self.old_secret = self.current_secret
                 self.current_secret = hashlib.sha256(f"{datetime.utcnow()}{Config.JWT_SECRET}".encode()).hexdigest()
-                await self.notify_user("all", "email", "JWT secret rotated, please re-login within 1 hour", priority=5)
+                await self.notify_user("all", "email", "JWT secret rotated, please re-login now", priority=10)
             except Exception as e:
                 logger.error(f"Ошибка при ротации ключей: {str(e)}")
-                await asyncio.sleep(60)  # Задержка перед повторной попыткой
+                await asyncio.sleep(60)
                 
 
     def _hash_password(self, password: str) -> str:
@@ -57,12 +62,11 @@ class AuthService:
     def _verify_password(self, plain_password: str, hashed_password: str) -> bool:
         return pwd_context.verify(plain_password, hashed_password)
 
-    def _generate_token(self, user_id: str, role: str, expires_delta: int) -> str:
+    def _generate_token(self, user_id: str, role: str, expiry: int) -> str:
         payload = {
             "sub": user_id,
             "role": role,
-            "exp": datetime.utcnow() + timedelta(seconds=expires_delta),
-            "iat": datetime.utcnow()
+            "exp": datetime.utcnow() + timedelta(seconds=expiry),
         }
         return jwt.encode(payload, self.current_secret, algorithm="HS256")
 
@@ -79,17 +83,8 @@ class AuthService:
                     raise AuthError("Неверный или просроченный токен")
             raise AuthError("Неверный или просроченный токен")
 
-    async def _log_audit(self, user_id: str, action: str, ip: str = None, user_agent: str = None):
-        """Логирование действий пользователя."""
-        audit_log = AuditLog(
-            user_id=user_id, 
-            action=action, 
-            timestamp=datetime.utcnow(), 
-            ip=ip, 
-            user_agent=user_agent
-        )
-        self.db.add(audit_log)
-        self.db.commit()
+    async def _log_audit(self, user_id: str, action: str) -> None:
+        logger.info(f"Аудит: пользователь {user_id} выполнил действие '{action}'")
 
     async def _check_login_attempts(self, email: str) -> bool:
         """Проверка количества попыток входа."""
@@ -114,34 +109,86 @@ class AuthService:
         key = f"login_attempts:{email}"
         await self.redis.delete(key)
 
-    async def notify_user(self, user_id: str, channel: str, message: str, priority: int = 1):
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{Config.NOTIFICATION_SERVICE_URL}/notifications/send",
-                json={"user_id": user_id, "channel": channel, "message": message, "priority": priority},
-                headers={"Authorization": f"Bearer {self._generate_service_token()}"}
-            ) as resp:
-                if resp.status != 200:
-                    logger.error(f"Failed to send notification: {await resp.text()}")
+    async def notify_user(self, user_id: str, method: str, message: str, priority: int = 1) -> None:
+        """Уведомление пользователя через RabbitMQ."""
+        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+            channel = await connection.channel()
+            await channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({
+                        "type": "notify_user",
+                        "data": {"user_id": user_id, "method": method, "message": message, "priority": priority}
+                    }).encode()
+                ),
+                routing_key="notifications_queue"
+            )
+        logger.info(f"Уведомление отправлено пользователю {user_id}: {message}")
 
-    async def register(self, email: str, password: str, company_name: str, inn: Optional[str] = None, role: str = "user"):
-        # Создание компании
-        company = Company(name=company_name, inn=inn)
+    async def register(self, email: str, password: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
+        """Регистрация пользователя с учетом типа компании."""
+        if self.db.query(User).filter(User.email == email).first():
+            raise AuthError("Пользователь с таким email уже существует")
+
+        # Валидация и создание компании
+        if company_type == "self_employed":
+            inn = company_data.get("inn")
+            company = Company(
+                name=f"Самозанятый {email.split('@')[0]}",
+                company_type="self_employed",
+                inn=inn if inn and len(inn) == 12 else None
+            )
+        elif company_type == "ip":
+            inn = company_data.get("inn")
+            ogrnip = company_data.get("ogrnip")
+            if not (inn and len(inn) == 12 and ogrnip and len(ogrnip) == 15):
+                raise AuthError("Неверный формат ИНН или ОГРНИП")
+            if self.db.query(Company).filter(Company.ogrnip == ogrnip).first():
+                raise AuthError("ОГРНИП уже зарегистрирован")
+            company = Company(
+                name=f"ИП {email.split('@')[0]}",
+                company_type="ip",
+                inn=inn,
+                ogrnip=ogrnip
+            )
+        elif company_type == "ooo":
+            company_name = company_data.get("company_name")
+            inn = company_data.get("inn")
+            ogrn = company_data.get("ogrn")
+            if not (company_name and inn and len(inn) == 12 and ogrn and len(ogrn) == 13):
+                raise AuthError("Неверный формат данных компании (название, ИНН или ОГРН)")
+            if self.db.query(Company).filter(Company.ogrn == ogrn).first():
+                raise AuthError("ОГРН уже зарегистрирован")
+            company = Company(
+                name=company_name,
+                company_type="ooo",
+                inn=inn,
+                ogrn=ogrn
+            )
+        else:
+            raise AuthError("Неверный тип компании")
+
+        # Проверка уникальности INN
+        if company.inn and self.db.query(Company).filter(Company.inn == company.inn).first():
+            raise AuthError("ИНН уже зарегистрирован")
+
         self.db.add(company)
         self.db.flush()  # Получаем company_id
+
         # Создание пользователя
         user = User(
             email=email,
             password_hash=self._hash_password(password),
             company_id=company.company_id,
-            role=role
+            role="user"
         )
         self.db.add(user)
         self.db.commit()
+
         user_id = str(user.user_id)
-        token = self._generate_token(user_id, role, Config.JWT_EXPIRY)
-        refresh_token = self._generate_token(user_id, role, Config.REFRESH_TOKEN_EXPIRY)
+        token = self._generate_token(user_id, "user", Config.JWT_EXPIRY)
+        refresh_token = self._generate_token(user_id, "user", Config.REFRESH_TOKEN_EXPIRY)
         await self.queue.send_notification(user_id, f"Ваш код верификации: {secrets.token_hex(3)}")
+        await self._log_audit(user_id, f"Registered as {company_type}")
         return user_id, token, refresh_token
 
     async def login(self, email: str, password: str) -> Tuple[str, str, str, str]:
@@ -189,6 +236,7 @@ class AuthService:
             logger.error(f"Неверный refresh token: {str(e)}")
             raise AuthError("Неверный refresh token")
 
+    # Обновление get_profile для возврата новых полей
     async def get_profile(self, user_id: str, csrf_token: Optional[str] = None) -> Dict:
         if csrf_token:
             if not await self.verify_csrf_token(user_id, csrf_token):
@@ -208,6 +256,9 @@ class AuthService:
             "email": user.email,
             "company_name": company.name,
             "inn": company.inn,
+            "company_type": company.company_type,
+            "ogrnip": company.ogrnip,
+            "ogrn": company.ogrn,
             "role": user.role,
             "editable": user.role == "admin"
         }
@@ -271,9 +322,10 @@ class AuthService:
         return google_auth_url
 
     async def google_callback(self, code: str, state: str) -> Tuple[str, str, str]:
-        """Обрабатывает callback от Google и возвращает токены."""
+        """Обрабатывает callback от Google с проверкой уникальности компании."""
         if not await self.redis.get(f"oauth_state:{state}"):
             raise AuthError("Неверный или просроченный state")
+        
         token_url = "https://oauth2.googleapis.com/token"
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -290,28 +342,34 @@ class AuthService:
                 if "id_token" not in token_data:
                     raise AuthError("Ошибка получения токена от Google")
 
-        # Проверяем id_token и получаем email
         id_info = id_token.verify_oauth2_token(
             token_data["id_token"], google_requests.Request(), Config.GOOGLE_CLIENT_ID
         )
         email = id_info["email"]
 
-        # Проверяем, существует ли пользователь с этой почтой
         user = self.db.query(User).filter(User.email == email).first()
         if not user:
-            # Создаём нового пользователя с email из Google
-            company = Company(name=f"Google User {email.split('@')[0]}")
-            self.db.add(company)
-            self.db.flush()
+            company_name = f"Google User {email.split('@')[0]}"
+            existing_company = self.db.query(Company).filter(Company.name == company_name).first()
+            if existing_company:
+                company = existing_company
+            else:
+                company = Company(name=company_name)
+                self.db.add(company)
+                self.db.flush()
+            
             user = User(
-                email=email,  # Сохраняем почту из Google
-                password_hash="",  # Пустой хэш для Google-пользователей
+                email=email,
+                password_hash="",
                 company_id=company.company_id,
                 role="user"
             )
             self.db.add(user)
             self.db.commit()
             logger.info(f"Создан новый пользователь через Google: {email}")
+            
+            # Создание онбординг чек-листа через RabbitMQ
+            await self._create_onboarding(user.user_id)
         else:
             logger.info(f"Существующий пользователь вошел через Google: {email}")
 
@@ -320,6 +378,46 @@ class AuthService:
         refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
         await self._log_audit(user_id, "Google login")
         return user_id, token, refresh_token
+    
+    async def _create_onboarding(self, user_id: uuid.UUID):
+        """Отправка запроса на создание онбординг чек-листа."""
+        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+            channel = await connection.channel()
+            await channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({"type": "create_onboarding", "data": {"user_id": str(user_id)}}).encode()
+                ),
+                routing_key="task_queue"
+            )
+        logger.info(f"Запрос на создание онбординга отправлен для {user_id}")
+
+    async def register(self, email: str, password: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
+        # Маппинг типов компаний
+        company_type_map = {
+            "Самозанятый": "self_employed",
+            "ИП": "ip",
+            "ООО": "ooo"
+        }
+        company_type = company_type_map.get(company_type, company_type)  # Преобразуем или оставляем как есть
+
+        if self.db.query(User).filter(User.email == email).first():
+            raise AuthError("Пользователь с таким email уже существует")
+        
+        existing_company = self.db.query(Company).filter(Company.name == company_name).first()
+        if existing_company:
+            company = existing_company
+        else:
+            company = Company(name=company_name)
+            self.db.add(company)
+            self.db.flush()
+        
+        user = User(email=email, password_hash=self._hash_password(password), company_id=company.company_id, role="user")
+        self.db.add(user)
+        self.db.commit()
+
+        # Создание онбординг чек-листа
+        await self._create_onboarding(user.user_id)
+        return {"user_id": str(user.user_id), "email": email}
 
     async def superadmin_report(self, requester_id: str, period: str) -> Dict:
         """Генерация отчета для SuperAdmin."""
@@ -429,22 +527,25 @@ class AuthService:
         return {"message": "Ссылка для сброса пароля отправлена на ваш email"}
 
     async def confirm_password_reset(self, reset_token: str, new_password: str) -> Dict:
-        """Подтверждение сброса пароля с использованием токена."""
+        """Подтверждение сброса пароля с одноразовым токеном."""
         user_id = await self.redis.get(f"reset:{reset_token}")
         if not user_id:
             logger.warning(f"Попытка сброса пароля с неверным или просроченным токеном: {reset_token}")
             raise AuthError("Неверный или просроченный токен сброса пароля")
+
+        used = await self.redis.get(f"reset_used:{reset_token}")
+        if used:
+            raise AuthError("Токен сброса пароля уже использован")
 
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user:
             logger.error(f"Пользователь с ID {user_id} не найден при сбросе пароля")
             raise AuthError("Пользователь не найден")
 
-        # Обновляем пароль
         user.password_hash = self._hash_password(new_password)
         self.db.commit()
 
-        # Удаляем токен из Redis после использования
+        await self.redis.set(f"reset_used:{reset_token}", "1", ex=3600)
         await self.redis.delete(f"reset:{reset_token}")
         
         await self._log_audit(user_id, "Password reset completed")
@@ -453,5 +554,5 @@ class AuthService:
 
 
     async def close(self) -> None:
-        """Закрытие соединения с Redis."""
         await self.redis.close()
+        self.queue.close()

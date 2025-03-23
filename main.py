@@ -30,8 +30,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
-    company_type: str = Field(..., regex="^(self_employed|ip|ooo)$")  # Ограничение на допустимые значения
-    company_data: Dict  # Данные компании в зависимости от типа
+    phone: str
+    company_type: str = Field(..., regex="^(self_employed|ip|ooo)$")
+    company_data: Dict
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -70,6 +71,13 @@ class PasswordResetConfirmRequest(BaseModel):
     token: str
     new_password: str
 
+class PayrollResponse(BaseModel):
+    id: str
+    user_id: str
+    period: str
+    amount: float
+    calculated_at: str
+
 def get_db():
     db = SessionLocal()
     try:
@@ -78,16 +86,15 @@ def get_db():
         db.close()
 
 async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> tuple[str, str]:
-    """Получение текущего пользователя из токена."""
     auth_service = AuthService(db)
     try:
-        return await auth_service.get_current_user(token)
+        user_id, role = await auth_service.get_current_user(token)
+        return user_id, role
     except AuthError as e:
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Header(...), db: Session = Depends(get_db)):
-    """Проверка CSRF-токена."""
     auth_service = AuthService(db)
     user_id, _ = await auth_service.get_current_user(token)
     if not await auth_service.verify_csrf_token(user_id, csrf_token):
@@ -101,10 +108,12 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
         user_id, token, refresh_token = await auth_service.register(
             request.email,
             request.password,
+            request.phone,
             request.company_type,
             request.company_data
         )
-        QueueService().send_notification(user_id, f"Добро пожаловать, {request.email}!")
+        queue_service = QueueService()
+        await queue_service.send_notification(user_id, f"Добро пожаловать, {request.email}!")
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
     except AuthError as e:
         logger.error(f"Ошибка при регистрации: {str(e)}")
@@ -142,66 +151,7 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
     except AuthError as e:
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
-
-@app.post("/time/start", summary="Начать трекинг времени")
-async def start_time_tracking(
-    task_id: str,
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
-    db: Session = Depends(get_db)
-):
-    user_id = token_data["user_id"]
-    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-        channel = await connection.channel()
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({
-                    "type": "start_time_tracking",
-                    "data": {"user_id": user_id, "task_id": task_id}
-                }).encode()
-            ),
-            routing_key="task_queue"
-        )
-    return {"message": "Трекинг времени начат"}
-
-@app.post("/time/stop", summary="Остановить трекинг времени")
-async def stop_time_tracking(
-    entry_id: str,
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
-    db: Session = Depends(get_db)
-):
-    user_id = token_data["user_id"]
-    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-        channel = await connection.channel()
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({
-                    "type": "stop_time_tracking",
-                    "data": {"user_id": user_id, "entry_id": entry_id}
-                }).encode()
-            ),
-            routing_key="task_queue"
-        )
-    return {"message": "Трекинг времени остановлен"}
-
-@app.post("/payroll/calculate", summary="Рассчитать зарплату")
-async def calculate_payroll(
-    period: str,
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
-    db: Session = Depends(get_db)
-):
-    user_id = token_data["user_id"]
-    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-        channel = await connection.channel()
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({
-                    "type": "calculate_payroll",
-                    "data": {"user_id": user_id, "period": period}
-                }).encode()
-            ),
-            routing_key="task_queue"
-        )
-    return {"message": "Расчет зарплаты запущен"}
+    
 
 @app.post("/leave/request", summary="Запрос на отпуск/больничный")
 async def request_leave(
@@ -410,8 +360,7 @@ def health_check():
 async def shutdown_event():
     auth_service = AuthService(SessionLocal())
     await auth_service.close()
-    queue_service = QueueService()
-    queue_service.close()
+    logger.info("Сервис аутентификации завершает работу")
 
 @app.on_event("startup")
 async def startup_event():

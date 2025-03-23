@@ -1,31 +1,34 @@
 import json
-import pika
-from config import Config
 import logging
+import aio_pika
+from config import Config
 
 logger = logging.getLogger("auth-service")
 
 class QueueService:
     def __init__(self):
-        self.connection = pika.BlockingConnection(pika.URLParameters(Config.RABBITMQ_URL))
-        self.channel = self.connection.channel()
-        self.channel.queue_declare(queue="notifications_queue", durable=True)
+        self.rabbitmq_url = Config.RABBITMQ_URL
 
-    def send_notification(self, user_id: str, message: str) -> None:
-        """Отправка уведомления в очередь."""
-        payload = {
-            "type": "notify",
-            "data": {"user_id": user_id, "channel": "email", "message": message}
-        }
-        self.channel.basic_publish(
-            exchange="",
-            routing_key="notifications_queue",
-            body=json.dumps(payload).encode(),
-            properties=pika.BasicProperties(delivery_mode=2)  # Делаем сообщение persistent
-        )
-        logger.info(f"Уведомление отправлено для {user_id}: {message}")
+    async def send_notification(self, user_id: str, message: str) -> None:
+        """Асинхронная отправка уведомления в очередь."""
+        try:
+            async with aio_pika.connect_robust(self.rabbitmq_url) as connection:
+                channel = await connection.channel()
+                await channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps({
+                            "type": "notify",
+                            "data": {"user_id": user_id, "channel": "email", "message": message}
+                        }).encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                    ),
+                    routing_key="notifications_queue"
+                )
+            logger.info(f"Уведомление отправлено для {user_id}: {message}")
+        except Exception as e:
+            logger.error(f"Ошибка при отправке уведомления: {str(e)}")
+            raise
 
-    def close(self) -> None:
-        """Закрытие соединения с RabbitMQ."""
-        self.connection.close()
-        logger.info("Соединение с RabbitMQ закрыто")
+    async def close(self) -> None:
+        """Закрытие соединения (в данном случае не требуется, так как используется контекстный менеджер)."""
+        logger.info("Соединение с RabbitMQ закрыто (контекстный менеджер)")

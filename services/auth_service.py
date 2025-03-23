@@ -17,6 +17,8 @@ from google.auth.transport import requests as google_requests
 from services.queue_service import QueueService
 import aiohttp
 import aio_pika
+import re 
+import uuid
 
 logger = logging.getLogger("auth-service")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -41,12 +43,10 @@ class AuthService:
         return self._generate_token("service", "service", Config.JWT_EXPIRY)
     
     async def rotate_keys_periodically(self):
-        """Периодическая смена JWT_SECRET с уведомлением за час."""
         while True:
             try:
                 await asyncio.sleep(self.rotation_interval - self.secret_rotation_window)
                 await self.notify_user("all", "email", "JWT secret will rotate in 1 hour, please prepare to re-login", priority=5)
-                
                 await asyncio.sleep(self.secret_rotation_window)
                 self.old_secret = self.current_secret
                 self.current_secret = hashlib.sha256(f"{datetime.utcnow()}{Config.JWT_SECRET}".encode()).hexdigest()
@@ -124,26 +124,40 @@ class AuthService:
             )
         logger.info(f"Уведомление отправлено пользователю {user_id}: {message}")
 
-    async def register(self, email: str, password: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
-        """Регистрация пользователя с учетом типа компании."""
+    async def register(self, email: str, password: str, phone: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
+        """Регистрация пользователя с учетом типа компании и дополнительных проверок."""
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Пользователь с таким email уже существует")
+
+        # Валидация телефона
+        if not re.match(r"^\+7\(\d{3}\)\s\d{3}-\d{2}-\d{2}$", phone):
+            raise AuthError("Неверный формат телефона. Используйте +7(XXX) XXX-XX-XX")
+
+        # Маппинг типов компаний
+        company_type_map = {
+            "Самозанятый": "self_employed",
+            "ИП": "ip",
+            "ООО": "ooo"
+        }
+        company_type = company_type_map.get(company_type, company_type)
 
         # Валидация и создание компании
         if company_type == "self_employed":
             inn = company_data.get("inn")
+            if inn and (len(inn) != 12 or not inn.isdigit()):
+                raise AuthError("ИНН должен содержать 12 цифр")
             company = Company(
                 name=f"Самозанятый {email.split('@')[0]}",
                 company_type="self_employed",
-                inn=inn if inn and len(inn) == 12 else None
+                inn=inn if inn else None
             )
         elif company_type == "ip":
             inn = company_data.get("inn")
             ogrnip = company_data.get("ogrnip")
-            if not (inn and len(inn) == 12 and ogrnip and len(ogrnip) == 15):
-                raise AuthError("Неверный формат ИНН или ОГРНИП")
-            if self.db.query(Company).filter(Company.ogrnip == ogrnip).first():
-                raise AuthError("ОГРНИП уже зарегистрирован")
+            if not (inn and len(inn) == 12 and inn.isdigit() and ogrnip and len(ogrnip) == 15 and ogrnip.isdigit()):
+                raise AuthError("ИНН (12 цифр) и ОГРНИП (15 цифр) обязательны и должны быть числовыми")
+            if self.db.query(Company).filter(Company.ogrnip == ogrnip, Company.company_type == "ip").first():
+                raise AuthError("ОГРНИП уже зарегистрирован для ИП")
             company = Company(
                 name=f"ИП {email.split('@')[0]}",
                 company_type="ip",
@@ -154,10 +168,10 @@ class AuthService:
             company_name = company_data.get("company_name")
             inn = company_data.get("inn")
             ogrn = company_data.get("ogrn")
-            if not (company_name and inn and len(inn) == 12 and ogrn and len(ogrn) == 13):
-                raise AuthError("Неверный формат данных компании (название, ИНН или ОГРН)")
-            if self.db.query(Company).filter(Company.ogrn == ogrn).first():
-                raise AuthError("ОГРН уже зарегистрирован")
+            if not (company_name and len(company_name) <= 100 and inn and len(inn) == 12 and inn.isdigit() and ogrn and len(ogrn) == 13 and ogrn.isdigit()):
+                raise AuthError("Название компании (макс. 100 символов), ИНН (12 цифр) и ОГРН (13 цифр) обязательны")
+            if self.db.query(Company).filter(Company.ogrn == ogrn, Company.company_type == "ooo").first():
+                raise AuthError("ОГРН уже зарегистрирован для ООО")
             company = Company(
                 name=company_name,
                 company_type="ooo",
@@ -172,7 +186,7 @@ class AuthService:
             raise AuthError("ИНН уже зарегистрирован")
 
         self.db.add(company)
-        self.db.flush()  # Получаем company_id
+        self.db.flush()
 
         # Создание пользователя
         user = User(
@@ -187,19 +201,38 @@ class AuthService:
         user_id = str(user.user_id)
         token = self._generate_token(user_id, "user", Config.JWT_EXPIRY)
         refresh_token = self._generate_token(user_id, "user", Config.REFRESH_TOKEN_EXPIRY)
+
+        # Отправка уведомления
         await self.queue.send_notification(user_id, f"Ваш код верификации: {secrets.token_hex(3)}")
+    
+        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+            channel = await connection.channel()
+            await channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({
+                        "type": "create_onboarding_tasks",
+                        "data": {
+                            "user_id": user_id,
+                            "company_type": company_type
+                        }
+                    }).encode()
+                ),
+                routing_key="task_queue"
+            )
+        logger.info(f"Запрос на создание онбординг-задач отправлен для {user_id}")
+
         await self._log_audit(user_id, f"Registered as {company_type}")
         return user_id, token, refresh_token
 
     async def login(self, email: str, password: str) -> Tuple[str, str, str, str]:
-        """Аутентификация с учетом ограничения попыток, аудита и CSRF."""
         if not await self._check_login_attempts(email):
             raise AuthError("Слишком много неудачных попыток входа. Попробуйте позже.")
 
         user = self.db.query(User).filter(User.email == email).first()
         if not user or not self._verify_password(password, user.password_hash):
             await self._increment_login_attempts(email)
-            await self._log_audit(user.user_id if user else "unknown", f"Failed login attempt for {email}")
+            user_id = str(user.user_id) if user else "unknown"
+            await self._log_audit(user_id, f"Failed login attempt for {email}")
             raise AuthError("Неверный email или пароль")
 
         await self._reset_login_attempts(email)
@@ -391,33 +424,6 @@ class AuthService:
             )
         logger.info(f"Запрос на создание онбординга отправлен для {user_id}")
 
-    async def register(self, email: str, password: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
-        # Маппинг типов компаний
-        company_type_map = {
-            "Самозанятый": "self_employed",
-            "ИП": "ip",
-            "ООО": "ooo"
-        }
-        company_type = company_type_map.get(company_type, company_type)  # Преобразуем или оставляем как есть
-
-        if self.db.query(User).filter(User.email == email).first():
-            raise AuthError("Пользователь с таким email уже существует")
-        
-        existing_company = self.db.query(Company).filter(Company.name == company_name).first()
-        if existing_company:
-            company = existing_company
-        else:
-            company = Company(name=company_name)
-            self.db.add(company)
-            self.db.flush()
-        
-        user = User(email=email, password_hash=self._hash_password(password), company_id=company.company_id, role="user")
-        self.db.add(user)
-        self.db.commit()
-
-        # Создание онбординг чек-листа
-        await self._create_onboarding(user.user_id)
-        return {"user_id": str(user.user_id), "email": email}
 
     async def superadmin_report(self, requester_id: str, period: str) -> Dict:
         """Генерация отчета для SuperAdmin."""

@@ -12,6 +12,7 @@ from typing import Optional, Dict
 import aio_pika
 import asyncio
 import json
+from models import User
 
 
 logger = logging.getLogger("auth-service")

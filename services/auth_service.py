@@ -36,7 +36,6 @@ class AuthService:
         self.max_login_attempts = Config.MAX_LOGIN_ATTEMPTS
         self.lockout_duration = Config.LOCKOUT_DURATION
         self.queue = QueueService()
-        asyncio.create_task(self.rotate_keys_periodically())
         self.secret_rotation_window = 3600
 
     def _generate_service_token(self) -> str:
@@ -168,8 +167,8 @@ class AuthService:
             company_name = company_data.get("company_name")
             inn = company_data.get("inn")
             ogrn = company_data.get("ogrn")
-            if not (company_name and len(company_name) <= 100 and inn and len(inn) == 12 and inn.isdigit() and ogrn and len(ogrn) == 13 and ogrn.isdigit()):
-                raise AuthError("Название компании (макс. 100 символов), ИНН (12 цифр) и ОГРН (13 цифр) обязательны")
+            if not (company_name and len(company_name) <= 100 and inn and len(inn) == 10 and inn.isdigit() and ogrn and len(ogrn) == 13 and ogrn.isdigit()):
+                raise AuthError("Название компании (макс. 100 символов), ИНН (10 цифр) и ОГРН (13 цифр) обязательны")
             if self.db.query(Company).filter(Company.ogrn == ogrn, Company.company_type == "ooo").first():
                 raise AuthError("ОГРН уже зарегистрирован для ООО")
             company = Company(
@@ -293,7 +292,8 @@ class AuthService:
             "ogrnip": company.ogrnip,
             "ogrn": company.ogrn,
             "role": user.role,
-            "editable": user.role == "admin"
+            "editable": user.role == "admin",
+            "company_id": str(company.company_id)
         }
         ttl = 3600 if user.role == "user" else 300
         await self._cache_profile(user_id, profile, ttl)

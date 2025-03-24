@@ -130,7 +130,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         user_id, token, refresh_token, csrf_token = await auth_service.login(request.email, request.password)
         return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token=csrf_token)
     except AuthError as e:
-        logger.error(f"Ошибка входа: {user_id}: {str(e)}")
+        logger.error(f"Ошибка входа для {request.email}: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
 @app.post("/logout", summary="Выход пользователя")
@@ -364,7 +364,8 @@ async def shutdown_event():
 
 @app.on_event("startup")
 async def startup_event():
-    service = AuthService(db=None)
+    db = SessionLocal()
+    service = AuthService(db)
     asyncio.create_task(service.rotate_keys_periodically())
 
 if __name__ == "__main__":

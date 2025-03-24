@@ -11,6 +11,7 @@ import logging
 from typing import Optional, Dict
 import aio_pika
 import asyncio
+import json
 
 
 logger = logging.getLogger("auth-service")

@@ -96,6 +96,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
+# Убрана зависимость verify_csrf как глобальная, используется только там, где нужна
 async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Header(...), db: Session = Depends(get_db)):
     auth_service = AuthService(db)
     user_id, _ = await auth_service.get_current_user(token)
@@ -153,17 +154,16 @@ async def refresh(refresh_token: str, db: Session = Depends(get_db)):
     except AuthError as e:
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
-    
 
 @app.post("/leave/request", summary="Запрос на отпуск/больничный")
 async def request_leave(
     leave_type: str,
     start_date: str,
     end_date: str,
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
     db: Session = Depends(get_db)
 ):
-    user_id = token_data["user_id"]
+    user_id, _ = user_id_role
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -185,10 +185,10 @@ async def request_leave(
 @app.post("/competitors/monitor", summary="Мониторинг конкурентов")
 async def monitor_competitors(
     urls: list[str],
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
     db: Session = Depends(get_db)
 ):
-    user_id = token_data["user_id"]
+    user_id, _ = user_id_role
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -206,10 +206,10 @@ async def monitor_competitors(
 async def get_promotion_recommendations(
     sales_data: dict,
     competitor_data: dict,
-    token_data: Dict = Depends(lambda token=Depends(oauth2_scheme): AuthService(None).verify_token(token)),
+    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
     db: Session = Depends(get_db)
 ):
-    user_id = token_data["user_id"]
+    user_id, _ = user_id_role
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -234,11 +234,18 @@ async def get_profile(
     profile = await auth_service.get_profile(user_id, csrf_token)
     return ProfileResponse(**profile)
 
-@app.put("/profile", response_model=ProfileResponse, dependencies=[Depends(verify_csrf)])
-async def update_profile(request: UpdateProfileRequest, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
+@app.put("/profile", response_model=ProfileResponse, summary="Обновление профиля")
+async def update_profile(
+    request: UpdateProfileRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),  # CSRF проверка перенесена сюда
+    db: Session = Depends(get_db)
+):
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
     try:
-        user_id, _ = user_id_role
-        auth_service = AuthService(db)
         profile = await auth_service.update_profile(user_id, request.email, request.company_name, request.inn)
         return ProfileResponse(**profile)
     except AuthError as e:
@@ -268,7 +275,7 @@ async def generate_report(request: ReportRequest, user_id_role: tuple = Depends(
     except AuthError as e:
         logger.error("Ошибка при генерации отчета")
         raise HTTPException(status_code=400, detail=str(e))
-    
+
 @app.get("/users", summary="Получение списка пользователей")
 async def get_users(db: Session = Depends(get_db), user_id_role: tuple = Depends(get_current_user)):
     user_id, role = user_id_role
@@ -303,7 +310,7 @@ async def google_login(db: Session = Depends(get_db)):
     auth_service = AuthService(db)
     url = await auth_service.google_login_url()
     return {"url": url}
-    
+
 @app.delete("/companies/{company_id}", summary="Удаление компании")
 async def delete_company(company_id: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
     """
@@ -316,7 +323,7 @@ async def delete_company(company_id: str, user_id_role: tuple = Depends(get_curr
             raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
 
         auth_service = AuthService(db)
-        await auth_service.delete_company(user_id, company_id)  # Вызов метода из AuthService
+        await auth_service.delete_company(user_id, company_id)
         return {"message": "Компания успешно удалена"}
     except AuthError as e:
         logger.error(f"Ошибка при удалении компании {company_id}: {str(e)}")
@@ -324,7 +331,7 @@ async def delete_company(company_id: str, user_id_role: tuple = Depends(get_curr
     except Exception as e:
         logger.error(f"Неизвестная ошибка при удалении компании {company_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось удалить компанию")
-    
+
 @app.post("/reset-password", summary="Запрос на сброс пароля")
 async def reset_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
     """Запрос на сброс пароля с отправкой ссылки на email."""
@@ -338,7 +345,7 @@ async def reset_password(request: PasswordResetRequest, db: Session = Depends(ge
     except Exception as e:
         logger.error(f"Неизвестная ошибка при запросе сброса пароля: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось обработать запрос на сброс пароля")
-    
+
 @app.post("/reset-password/confirm", summary="Подтверждение сброса пароля")
 async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
     """Подтверждение сброса пароля с использованием токена и нового пароля."""

@@ -70,16 +70,28 @@ class AuthService:
         return jwt.encode(payload, self.current_secret, algorithm="HS256")
 
     def _verify_token(self, token: str) -> dict:
-        """Проверка токена с учетом текущего и старого ключа."""
+        """Проверка токена с учетом текущего и старого ключа, включая кэширование и проверку времени."""
         try:
-            return jwt.decode(token, self.current_secret, algorithms=["HS256"])
-        except jwt.JWTError:
+            # Проверка черного списка
+            if asyncio.run(self.redis.get(f"blacklist:{token}")):
+                raise AuthError("Токен в черном списке")
+
+            # Попытка декодирования с текущим ключом
+            payload = jwt.decode(token, self.current_secret, algorithms=["HS256"])
+            return payload
+        except jwt.JWTError as e:
             if self.old_secret:
                 try:
-                    return jwt.decode(token, self.old_secret, algorithms=["HS256"])
-                except jwt.JWTError as e:
-                    logger.error(f"Token verification failed: {str(e)}")
+                    # Декодирование со старым ключом
+                    payload = jwt.decode(token, self.old_secret, algorithms=["HS256"])
+                    # Проверка, не слишком ли старый токен
+                    if datetime.utcnow() > datetime.fromtimestamp(payload["exp"]) + timedelta(seconds=self.secret_rotation_window):
+                        raise AuthError("Токен слишком старый")
+                    return payload
+                except jwt.JWTError:
+                    logger.error(f"Ошибка проверки токена с обоими ключами: {str(e)}")
                     raise AuthError("Неверный или просроченный токен")
+            logger.error(f"Ошибка проверки токена: {str(e)}")
             raise AuthError("Неверный или просроченный токен")
 
     async def _log_audit(self, user_id: str, action: str) -> None:

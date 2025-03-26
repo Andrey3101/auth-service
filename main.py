@@ -89,6 +89,25 @@ class PayrollResponse(BaseModel):
     amount: float
     calculated_at: str
 
+class ClientRequest(BaseModel):
+    name: str
+    phone: Optional[str] = None
+    email: Optional[EmailStr] = None
+    amount: Optional[int] = None
+    description: Optional[str] = None
+
+class ClientResponse(BaseModel):
+    client_id: str
+    company_id: str
+    user_id: Optional[str]
+    name: str
+    phone: Optional[str]
+    email: Optional[str]
+    amount: Optional[int]
+    description: Optional[str]
+    created_at: str
+    updated_at: str
+
 def get_db():
     db = SessionLocal()
     try:
@@ -244,7 +263,7 @@ async def monitor_competitors(
 async def get_promotion_recommendations(
     sales_data: dict,
     competitor_data: dict,
-    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
+    user_id_role: tuple = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     user_id, _ = user_id_role
@@ -438,6 +457,102 @@ async def update_user(
     except Exception as e:
         logger.error(f"Неизвестная ошибка при обновлении пользователя {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось обновить пользователя")
+    
+@app.post("/clients", response_model=ClientResponse, summary="Добавить клиента")
+async def add_client(
+    request: ClientRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    try:
+        client = await auth_service.add_client(
+            user_id=user_id,
+            company_id=(db.query(User).filter(User.user_id == user_id).first()).company_id,
+            name=request.name,
+            phone=request.phone,
+            email=request.email,
+            amount=request.amount,
+            description=request.description
+        )
+        # Отправка в ai-service через RabbitMQ
+        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+            channel = await connection.channel()
+            await channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps({
+                        "type": "add_client",
+                        "data": {
+                            "user_id": user_id,
+                            "client_id": str(client["client_id"]),
+                            "name": client["name"],
+                            "amount": client["amount"],
+                            "description": client["description"]
+                        }
+                    }).encode()
+                ),
+                routing_key="ai_queue"
+            )
+        return ClientResponse(**client)
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/clients", response_model=List[ClientResponse], summary="Получить список клиентов")
+async def get_clients(
+    user_id_role: tuple = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    try:
+        clients = await auth_service.get_clients(user_id)
+        return [ClientResponse(**client) for client in clients]
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/clients/{client_id}", response_model=ClientResponse, summary="Обновить клиента")
+async def update_client(
+    client_id: str,
+    request: ClientRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        client = await auth_service.update_client(
+            client_id=client_id,
+            user_id=user_id,
+            name=request.name,
+            phone=request.phone,
+            email=request.email,
+            amount=request.amount,
+            description=request.description
+        )
+        return ClientResponse(**client)
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/clients/{client_id}", summary="Удалить клиента")
+async def delete_client(
+    client_id: str,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        await auth_service.delete_client(client_id, user_id)
+        return {"message": "Клиент удалён"}
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health", summary="Проверка состояния")
 def health_check():
@@ -455,6 +570,27 @@ async def startup_event():
     db = SessionLocal()
     service = AuthService(db)
     asyncio.create_task(service.rotate_keys_periodically())
+
+    # Добавляем слушателя ai_queue
+    async def consume_ai_queue():
+        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+            channel = await connection.channel()
+            queue = await channel.declare_queue("ai_queue")
+            async for message in queue:
+                with message.process():
+                    data = json.loads(message.body.decode())
+                    if data["type"] == "add_client":
+                        auth_service = AuthService(SessionLocal())
+                        await auth_service.add_client(
+                            user_id=data["data"]["user_id"],
+                            company_id=data["data"]["company_id"],
+                            name=data["data"]["name"],
+                            phone=data["data"].get("phone")
+                        )
+                        logger.info(f"Клиент добавлен через ai_queue: {data['data']['name']}")
+
+    asyncio.create_task(consume_ai_queue())
+    logger.info("Потребитель RabbitMQ для ai_queue запущен")
 
 if __name__ == "__main__":
     import uvicorn

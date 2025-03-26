@@ -7,7 +7,7 @@ from typing import Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from config import Config
-from models import User, Company, AuditLog
+from models import User, Company, AuditLog, Client
 from passlib.context import CryptContext
 import redis.asyncio as redis
 import asyncio
@@ -636,6 +636,127 @@ class AuthService:
             raise AuthError("Токен в черном списке")
         payload = self._verify_token(token)
         return payload["sub"], payload["role"]
+
+    async def add_client(
+        self,
+        user_id: str,
+        company_id: str,
+        name: str,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        amount: Optional[int] = None,
+        description: Optional[str] = None
+    ) -> Dict:
+        """Добавление клиента."""
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or user.company_id != company_id:
+            raise AuthError("У вас нет прав добавлять клиентов в эту компанию")
+
+        client = Client(
+            company_id=company_id,
+            user_id=user_id,
+            name=name,
+            phone=phone,
+            email=email,
+            amount=amount,
+            description=description
+        )
+        self.db.add(client)
+        self.db.commit()
+
+        await self._log_audit(user_id, f"Added client {client.client_id}")
+        logger.info(f"Клиент {name} добавлен пользователем {user_id}")
+
+        return {
+            "client_id": str(client.client_id),
+            "company_id": client.company_id,
+            "user_id": client.user_id,
+            "name": client.name,
+            "phone": client.phone,
+            "email": client.email,
+            "amount": client.amount,
+            "description": client.description,
+            "created_at": client.created_at.isoformat(),
+            "updated_at": client.updated_at.isoformat()
+        }
+
+    async def get_clients(self, user_id: str) -> List[Dict]:
+        """Получение списка клиентов компании пользователя."""
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user:
+            raise AuthError("Пользователь не найден")
+
+        clients = self.db.query(Client).filter(Client.company_id == user.company_id).all()
+        return [{
+            "client_id": str(c.client_id),
+            "company_id": c.company_id,
+            "user_id": c.user_id,
+            "name": c.name,
+            "phone": c.phone,
+            "email": c.email,
+            "amount": c.amount,
+            "description": c.description,
+            "created_at": c.created_at.isoformat(),
+            "updated_at": c.updated_at.isoformat()
+        } for c in clients]
+
+    async def update_client(
+        self,
+        client_id: str,
+        user_id: str,
+        name: str,
+        phone: Optional[str] = None,
+        email: Optional[str] = None,
+        amount: Optional[int] = None,
+        description: Optional[str] = None
+    ) -> Dict:
+        """Обновление данных клиента."""
+        client = self.db.query(Client).filter(Client.client_id == uuid.UUID(client_id)).first()
+        if not client:
+            raise AuthError("Клиент не найден")
+
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or client.company_id != user.company_id:
+            raise AuthError("У вас нет прав обновлять этого клиента")
+
+        client.name = name
+        client.phone = phone
+        client.email = email
+        client.amount = amount
+        client.description = description
+        self.db.commit()
+
+        await self._log_audit(user_id, f"Updated client {client_id}")
+        logger.info(f"Клиент {client_id} обновлён пользователем {user_id}")
+
+        return {
+            "client_id": str(client.client_id),
+            "company_id": client.company_id,
+            "user_id": client.user_id,
+            "name": client.name,
+            "phone": client.phone,
+            "email": client.email,
+            "amount": client.amount,
+            "description": client.description,
+            "created_at": client.created_at.isoformat(),
+            "updated_at": client.updated_at.isoformat()
+        }
+
+    async def delete_client(self, client_id: str, user_id: str):
+        """Удаление клиента."""
+        client = self.db.query(Client).filter(Client.client_id == uuid.UUID(client_id)).first()
+        if not client:
+            raise AuthError("Клиент не найден")
+
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or client.company_id != user.company_id:
+            raise AuthError("У вас нет прав удалять этого клиента")
+
+        self.db.delete(client)
+        self.db.commit()
+
+        await self._log_audit(user_id, f"Deleted client {client_id}")
+        logger.info(f"Клиент {client_id} удалён пользователем {user_id}")
     
     async def request_password_reset(self, email: str):
         """Запрос на сброс пароля с генерацией токена и отправкой ссылки на email."""

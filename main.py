@@ -63,6 +63,10 @@ class UpdateProfileRequest(BaseModel):
 class ReportRequest(BaseModel):
     period: str
 
+class UpdateUserRequest(BaseModel):
+    email: EmailStr
+    role: str = Field(..., regex="^(user|manager|admin)$")
+
 class DeleteCompanyRequest(BaseModel):
     company_id: str
 
@@ -400,6 +404,40 @@ async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Sessi
     except Exception as e:
         logger.error(f"Неизвестная ошибка при подтверждении сброса пароля: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось сбросить пароль")
+    
+@app.put("/users/{user_id}", summary="Обновление пользователя")
+async def update_user(
+    user_id: str,
+    request: UpdateUserRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    """Обновление данных пользователя (email, роль) администратором или super_admin."""
+    requester_id, requester_role = user_id_role
+    auth_service = AuthService(db)
+    
+    if not await auth_service.verify_csrf_token(requester_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    
+    try:
+        updated_user = await auth_service.update_user(
+            user_id=user_id,
+            requester_id=requester_id,
+            email=request.email,
+            role=request.role
+        )
+        return {
+            "user_id": updated_user["user_id"],
+            "email": updated_user["email"],
+            "role": updated_user["role"]
+        }
+    except AuthError as e:
+        logger.error(f"Ошибка при обновлении пользователя {user_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при обновлении пользователя {user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail="Не удалось обновить пользователя")
 
 @app.get("/health", summary="Проверка состояния")
 def health_check():

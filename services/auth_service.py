@@ -583,6 +583,53 @@ class AuthService:
         await self._log_audit(requester_id, f"Deleted company {company_id} and all its users")
         logger.info(f"Компания {company_id} и все связанные пользователи удалены пользователем {requester_id}")
 
+        async def update_user(self, user_id: str, requester_id: str, email: str, role: str) -> Dict:
+            """Обновление данных пользователя (email, роль) с проверкой прав и уникальности."""
+            # Проверка существования пользователя, которого обновляют
+            target_user = self.db.query(User).filter(User.user_id == user_id).first()
+            if not target_user:
+                logger.error(f"Пользователь {user_id} не найден для обновления")
+                raise AuthError("Пользователь не найден")
+
+            # Проверка прав запросившего
+            requester = self.db.query(User).filter(User.user_id == requester_id).first()
+            if not requester:
+                raise AuthError("Запросивший пользователь не найден")
+            
+            if requester.role not in ["admin", "super_admin"]:
+                raise AuthError("Требуются права admin или super_admin")
+            
+            # Ограничение для admin: обновлять можно только пользователей своей компании
+            if requester.role == "admin" and requester.company_id != target_user.company_id:
+                raise AuthError("Вы можете обновлять только пользователей своей компании")
+            
+            # Ограничение для admin: нельзя менять роль на admin или super_admin
+            if requester.role == "admin" and role in ["admin", "super_admin"]:
+                raise AuthError("Администратор не может назначить роль admin или super_admin")
+            
+            # Проверка уникальности email
+            if email != target_user.email and self.db.query(User).filter(User.email == email).first():
+                raise AuthError("Email уже используется другим пользователем")
+
+            # Обновление данных
+            target_user.email = email
+            target_user.role = role if role in ["user", "manager", "admin"] else target_user.role  # Ограничение ролей
+            
+            self.db.commit()
+            
+            # Очистка кэша профиля
+            await self.redis.delete(f"profile:{user_id}")
+            
+            # Логирование действия
+            await self._log_audit(requester_id, f"Updated user {user_id} (email: {email}, role: {role})")
+            logger.info(f"Пользователь {user_id} обновлён пользователем {requester_id}: email={email}, role={role}")
+            
+            return {
+                "user_id": str(target_user.user_id),
+                "email": target_user.email,
+                "role": target_user.role
+            }
+
     async def get_current_user(self, token: str) -> Tuple[str, str]:
         """Получение текущего пользователя из токена с проверкой черного списка."""
         if await self.redis.get(f"blacklist:{token}"):

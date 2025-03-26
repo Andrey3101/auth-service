@@ -73,6 +73,11 @@ class PasswordResetConfirmRequest(BaseModel):
     token: str
     new_password: str
 
+class CreateUserRequest(BaseModel):
+    email: EmailStr
+    password: str
+    role: str = Field(..., regex="^(user|manager)$")
+
 class PayrollResponse(BaseModel):
     id: str
     user_id: str
@@ -142,6 +147,35 @@ async def logout(token: str = Depends(oauth2_scheme), db: Session = Depends(get_
     auth_service = AuthService(db)
     await auth_service.logout(token)
     return {"message": "Успешный выход"}
+
+@app.post("/companies/{company_id}/users", response_model=TokenResponse, summary="Создание пользователя в компании")
+async def create_user_in_company(
+    company_id: str,
+    request: CreateUserRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    """Создание нового пользователя в указанной компании администратором."""
+    requester_id, _ = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(requester_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        user_id, token, refresh_token = await auth_service.create_user_in_company(
+            requester_id,
+            company_id,
+            request.email,
+            request.password,
+            request.role
+        )
+        return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
+    except AuthError as e:
+        logger.error(f"Ошибка при создании пользователя в компании {company_id}: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при создании пользователя: {str(e)}")
+        raise HTTPException(status_code=500, detail="Не удалось создать пользователя")
 
 @app.post("/refresh", response_model=TokenResponse, summary="Обновление токена")
 async def refresh(refresh_token: str, db: Session = Depends(get_db)):
@@ -312,19 +346,26 @@ async def google_login(db: Session = Depends(get_db)):
     return {"url": url}
 
 @app.delete("/companies/{company_id}", summary="Удаление компании")
-async def delete_company(company_id: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
+async def delete_company(
+    company_id: str,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
     """
-    Удаление компании по company_id.
+    Удаление компании по company_id вместе со всеми связанными пользователями.
     Только для пользователей с ролью admin или super_admin.
     """
     try:
         user_id, role = user_id_role
+        auth_service = AuthService(db)
+        if not await auth_service.verify_csrf_token(user_id, csrf_token):
+            raise HTTPException(status_code=403, detail="Invalid CSRF token")
         if role not in ["admin", "super_admin"]:
             raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
 
-        auth_service = AuthService(db)
         await auth_service.delete_company(user_id, company_id)
-        return {"message": "Компания успешно удалена"}
+        return {"message": "Компания и все связанные пользователи успешно удалены"}
     except AuthError as e:
         logger.error(f"Ошибка при удалении компании {company_id}: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))

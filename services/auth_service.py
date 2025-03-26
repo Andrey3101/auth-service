@@ -27,6 +27,8 @@ class AuthError(Exception):
     pass
 
 class AuthService:
+    MAX_USERS_PER_COMPANY = 8
+
     def __init__(self, db: Session):
         self.db = db
         self.redis = redis.Redis.from_url(Config.REDIS_URL, decode_responses=True)
@@ -136,7 +138,7 @@ class AuthService:
         logger.info(f"Уведомление отправлено пользователю {user_id}: {message}")
 
     async def register(self, email: str, password: str, phone: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
-        """Регистрация пользователя с учетом типа компании и дополнительных проверок."""
+        """Регистрация пользователя с учетом типа компании, дополнительных проверок и лимита пользователей."""
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Пользователь с таким email уже существует")
 
@@ -152,7 +154,7 @@ class AuthService:
         }
         company_type = company_type_map.get(company_type, company_type)
 
-        # Валидация и создание компании
+        # Создание компании
         if company_type == "self_employed":
             inn = company_data.get("inn")
             if inn and (len(inn) != 12 or not inn.isdigit()):
@@ -197,7 +199,13 @@ class AuthService:
             raise AuthError("ИНН уже зарегистрирован")
 
         self.db.add(company)
-        self.db.flush()
+        self.db.flush()  # Получаем company_id
+
+        # Проверка лимита пользователей в компании
+        user_count = self.db.query(User).filter(User.company_id == company.company_id).count()
+        if user_count >= self.MAX_USERS_PER_COMPANY:
+            self.db.rollback()  # Откатываем создание компании
+            raise AuthError(f"Достигнут лимит пользователей ({self.MAX_USERS_PER_COMPANY}) для этой компании")
 
         # Создание пользователя
         user = User(
@@ -215,7 +223,7 @@ class AuthService:
 
         # Отправка уведомления
         await self.queue.send_notification(user_id, f"Ваш код верификации: {secrets.token_hex(3)}")
-    
+
         async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
             channel = await connection.channel()
             await channel.default_exchange.publish(
@@ -233,6 +241,50 @@ class AuthService:
         logger.info(f"Запрос на создание онбординг-задач отправлен для {user_id}")
 
         await self._log_audit(user_id, f"Registered as {company_type}")
+        return user_id, token, refresh_token
+    
+    async def create_user_in_company(self, requester_id: str, company_id: str, email: str, password: str, role: str) -> Tuple[str, str, str]:
+        """Создание нового пользователя в указанной компании с проверкой прав и лимита."""
+        # Проверка прав запросившего пользователя
+        requester = self.db.query(User).filter(User.user_id == requester_id).first()
+        if not requester:
+            raise AuthError("Запросивший пользователь не найден")
+        if requester.role != "admin" or requester.company_id != company_id:
+            raise AuthError("Только администратор компании может создавать пользователей")
+
+        # Проверка существования компании
+        company = self.db.query(Company).filter(Company.company_id == company_id).first()
+        if not company:
+            raise AuthError("Компания не найдена")
+
+        # Проверка лимита пользователей в компании
+        user_count = self.db.query(User).filter(User.company_id == company_id).count()
+        if user_count >= self.MAX_USERS_PER_COMPANY:
+            raise AuthError(f"Достигнут лимит пользователей ({self.MAX_USERS_PER_COMPANY}) для этой компании")
+
+        # Проверка уникальности email
+        if self.db.query(User).filter(User.email == email).first():
+            raise AuthError("Пользователь с таким email уже существует")
+
+        # Создание нового пользователя
+        user = User(
+            email=email,
+            password_hash=self._hash_password(password),
+            company_id=company_id,
+            role=role if role in ["user", "manager"] else "user"  # Ограничение ролей
+        )
+        self.db.add(user)
+        self.db.commit()
+
+        user_id = str(user.user_id)
+        token = self._generate_token(user_id, user.role, Config.JWT_EXPIRY)
+        refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
+
+        # Отправка уведомления новому пользователю
+        await self.queue.send_notification(user_id, f"Вы были добавлены в компанию {company.name}. Ваш email: {email}")
+
+        await self._log_audit(requester_id, f"Created user {user_id} in company {company_id}")
+        logger.info(f"Пользователь {user_id} создан в компании {company_id} администратором {requester_id}")
         return user_id, token, refresh_token
 
     async def login(self, email: str, password: str) -> Tuple[str, str, str, str]:
@@ -498,23 +550,38 @@ class AuthService:
     async def _cache_profile(self, user_id: str, profile: Dict, ttl: int = 600) -> None:
         await self.redis.set(f"profile:{user_id}", json.dumps(profile), ex=ttl)
 
-    async def delete_company(self, user_id: str, company_id: str):
-        """Удаление компании по company_id."""
-        # Получаем пользователя и проверяем его роль
-        user = self.db.query(User).filter_by(user_id=user_id).first()
-        if not user or user.role not in ["admin", "super_admin"]:
-            raise AuthError("Недостаточно прав для удаления компании")
+    async def delete_company(self, requester_id: str, company_id: str):
+        """Удаление компании и всех связанных пользователей."""
+        requester = self.db.query(User).filter(User.user_id == requester_id).first()
+        if not requester:
+            raise AuthError("Пользователь не найден")
+        if requester.role not in ["admin", "super_admin"]:
+            raise AuthError("Требуются права admin или super_admin")
+        if requester.role == "admin" and requester.company_id != company_id:
+            raise AuthError("Вы можете удалить только свою компанию")
 
-        # Находим компанию по company_id
-        company = self.db.query(Company).filter_by(company_id=company_id).first()
+        company = self.db.query(Company).filter(Company.company_id == company_id).first()
         if not company:
             raise AuthError("Компания не найдена")
 
-        # Удаляем компанию
+        # Удаление всех пользователей компании
+        users = self.db.query(User).filter(User.company_id == company_id).all()
+        if not users:
+            raise AuthError("Пользователи компании не найдены")
+
+        for user in users:
+            # Удаление записей из Redis (если есть)
+            await self.redis.delete(f"csrf:{user.user_id}")
+            await self.redis.delete(f"login_attempts:{user.user_id}")
+            # Удаление пользователя из базы
+            self.db.delete(user)
+
+        # Удаление компании
         self.db.delete(company)
         self.db.commit()
 
-        logger.info(f"Компания {company_id} успешно удалена пользователем {user_id}")
+        await self._log_audit(requester_id, f"Deleted company {company_id} and all its users")
+        logger.info(f"Компания {company_id} и все связанные пользователи удалены пользователем {requester_id}")
 
     async def get_current_user(self, token: str) -> Tuple[str, str]:
         """Получение текущего пользователя из токена с проверкой черного списка."""

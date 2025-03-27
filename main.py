@@ -498,7 +498,7 @@ async def add_client(
     except AuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/clients", response_model=List[ClientResponse], summary="Получить список клиентов")
+@app.get("/clients", response_model=list[ClientResponse], summary="Получить список клиентов")
 async def get_clients(
     user_id_role: tuple = Depends(get_current_user),
     db: Session = Depends(get_db)

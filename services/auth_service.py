@@ -680,7 +680,7 @@ class AuthService:
             "updated_at": client.updated_at.isoformat()
         }
 
-    async def get_clients(self, user_id: str) -> List[Dict]:
+    async def get_clients(self, user_id: str) -> list[Dict]:
         """Получение списка клиентов компании пользователя."""
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user:

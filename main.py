@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi import FastAPI, Depends, HTTPException, Header, Query
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy import create_engine
 from fastapi.security import OAuth2PasswordBearer
@@ -458,6 +458,22 @@ async def update_user(
         logger.error(f"Неизвестная ошибка при обновлении пользователя {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось обновить пользователя")
     
+@app.get("/clients", response_model=list[ClientResponse], summary="Получить список клиентов")
+async def get_clients(
+    user_id_role: tuple = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    name: Optional[str] = Query(None, description="Фильтр по имени клиента (частичное совпадение)"),
+    amount_min: Optional[int] = Query(None, description="Минимальная сумма"),
+    amount_max: Optional[int] = Query(None, description="Максимальная сумма")
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    try:
+        clients = await auth_service.get_clients(user_id, name=name, amount_min=amount_min, amount_max=amount_max)
+        return [ClientResponse(**client) for client in clients]
+    except AuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.post("/clients", response_model=ClientResponse, summary="Добавить клиента")
 async def add_client(
     request: ClientRequest,
@@ -498,18 +514,6 @@ async def add_client(
     except AuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-@app.get("/clients", response_model=list[ClientResponse], summary="Получить список клиентов")
-async def get_clients(
-    user_id_role: tuple = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    user_id, role = user_id_role
-    auth_service = AuthService(db)
-    try:
-        clients = await auth_service.get_clients(user_id)
-        return [ClientResponse(**client) for client in clients]
-    except AuthError as e:
-        raise HTTPException(status_code=400, detail=str(e))
 
 @app.put("/clients/{client_id}", response_model=ClientResponse, summary="Обновить клиента")
 async def update_client(

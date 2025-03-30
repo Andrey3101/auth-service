@@ -680,14 +680,36 @@ class AuthService:
             "updated_at": client.updated_at.isoformat()
         }
 
-    async def get_clients(self, user_id: str) -> list[Dict]:
-        """Получение списка клиентов компании пользователя."""
+    async def get_clients(
+        self,
+        user_id: str,
+        name: Optional[str] = None,
+        amount_min: Optional[int] = None,
+        amount_max: Optional[int] = None
+    ) -> list[Dict]:
+        """Получение списка клиентов с фильтрацией по имени и сумме."""
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user:
             raise AuthError("Пользователь не найден")
 
-        clients = self.db.query(Client).filter(Client.company_id == user.company_id).all()
-        return [{
+        query = self.db.query(Client).filter(Client.company_id == user.company_id)
+
+        # Фильтр по имени (частичное совпадение)
+        if name:
+            query = query.filter(Client.name.ilike(f"%{name}%"))
+
+        # Фильтр по сумме
+        if amount_min is not None:
+            query = query.filter(Client.amount >= amount_min)
+        if amount_max is not None:
+            query = query.filter(Client.amount <= amount_max)
+
+        # Исключение клиентов с amount=None при активных фильтрах по сумме
+        if amount_min is not None or amount_max is not None:
+            query = query.filter(Client.amount.isnot(None))
+
+        clients = query.all()
+        result = [{
             "client_id": str(c.client_id),
             "company_id": c.company_id,
             "user_id": c.user_id,
@@ -699,6 +721,9 @@ class AuthService:
             "created_at": c.created_at.isoformat(),
             "updated_at": c.updated_at.isoformat()
         } for c in clients]
+
+        logger.info(f"Получено {len(result)} клиентов для user_id={user_id} с фильтрами name={name}, amount_min={amount_min}, amount_max={amount_max}")
+        return result
 
     async def update_client(
         self,

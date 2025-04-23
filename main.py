@@ -33,7 +33,7 @@ class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     phone: str
-    company_type: str = Field(..., regex="^(self_employed|ip|ooo)$")
+    company_type: str = Field(..., pattern="^(self_employed|ip|ooo)$")
     company_data: Dict
 
 class LoginRequest(BaseModel):
@@ -65,7 +65,7 @@ class ReportRequest(BaseModel):
 
 class UpdateUserRequest(BaseModel):
     email: EmailStr
-    role: str = Field(..., regex="^(user|manager|admin)$")
+    role: str = Field(..., pattern="^(user|manager|admin)$")
 
 class DeleteCompanyRequest(BaseModel):
     company_id: str
@@ -80,7 +80,7 @@ class PasswordResetConfirmRequest(BaseModel):
 class CreateUserRequest(BaseModel):
     email: EmailStr
     password: str
-    role: str = Field(..., regex="^(user|manager)$")
+    role: str = Field(..., pattern="^(user|manager)$")
 
 class PayrollResponse(BaseModel):
     id: str
@@ -577,7 +577,8 @@ async def startup_event():
 
     # Добавляем слушателя ai_queue
     async def consume_ai_queue():
-        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
+        connection = await aio_pika.connect_robust(Config.RABBITMQ_URL)  # Ожидаем корутину
+        async with connection:
             channel = await connection.channel()
             queue = await channel.declare_queue("ai_queue")
             async for message in queue:

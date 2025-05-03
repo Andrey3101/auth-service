@@ -8,12 +8,11 @@ from services.auth_service import AuthService, AuthError
 from services.queue_service import QueueService
 from models import Base
 import logging
-from typing import Optional, Dict
+from typing import Optional, Dict, List
 import aio_pika
 import asyncio
 import json
 from models import User
-
 
 logger = logging.getLogger("auth-service")
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +53,9 @@ class ProfileResponse(BaseModel):
     role: str
     editable: bool = False
     tasks_endpoint: str | None = None
+    subscription_status: str
+    trial_end: Optional[str]
+    attachedCard: Optional[Dict[str, str]]
 
 class UpdateProfileRequest(BaseModel):
     email: EmailStr
@@ -108,6 +110,46 @@ class ClientResponse(BaseModel):
     created_at: str
     updated_at: str
 
+class SubscriptionPaymentRequest(BaseModel):
+    company_id: str
+    card_id: Optional[str] = None
+
+class SubscriptionPaymentResponse(BaseModel):
+    payment_url: str
+    payment_id: str
+
+class ConfirmSubscriptionPaymentRequest(BaseModel):
+    payment_id: str
+
+class AttachCardRequest(BaseModel):
+    company_id: str
+    card_number: str = Field(..., pattern=r'^\d{16}$')
+    expiry: str = Field(..., pattern=r'^\d{2}/\d{2}$')
+    cvc: str = Field(..., pattern=r'^\d{3}$')
+
+class DetachCardRequest(BaseModel):
+    company_id: str
+    card_id: str
+
+class CardResponse(BaseModel):
+    card_id: str
+    company_id: str
+    last4: str
+    brand: str
+    is_active: bool
+    created_at: str
+
+class PaymentHistoryResponse(BaseModel):
+    payment_id: str
+    company_id: str
+    amount: float
+    status: str
+    created_at: str
+    card_id: Optional[str]
+
+class ActivateTrialRequest(BaseModel):
+    company_id: str
+
 def get_db():
     db = SessionLocal()
     try:
@@ -124,7 +166,6 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         logger.error(f"Ошибка аутентификации для токена: {str(e)}")
         raise HTTPException(status_code=401, detail=str(e))
 
-# Убрана зависимость verify_csrf как глобальная, используется только там, где нужна
 async def verify_csrf(token: str = Depends(oauth2_scheme), csrf_token: str = Header(...), db: Session = Depends(get_db)):
     auth_service = AuthService(db)
     user_id, _ = await auth_service.get_current_user(token)
@@ -155,7 +196,6 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
 
 @app.post("/login", response_model=TokenResponse, summary="Вход пользователя")
 async def login(request: LoginRequest, db: Session = Depends(get_db)):
-    """Аутентификация пользователя с выдачей access, refresh и CSRF токенов."""
     auth_service = AuthService(db)
     try:
         user_id, token, refresh_token, csrf_token = await auth_service.login(request.email, request.password)
@@ -166,7 +206,6 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
 
 @app.post("/logout", summary="Выход пользователя")
 async def logout(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    """Выход пользователя из системы."""
     auth_service = AuthService(db)
     await auth_service.logout(token)
     return {"message": "Успешный выход"}
@@ -179,7 +218,6 @@ async def create_user_in_company(
     csrf_token: str = Header(..., alias="X-CSRF-Token"),
     db: Session = Depends(get_db)
 ):
-    """Создание нового пользователя в указанной компании администратором."""
     requester_id, _ = user_id_role
     auth_service = AuthService(db)
     if not await auth_service.verify_csrf_token(requester_id, csrf_token):
@@ -202,7 +240,6 @@ async def create_user_in_company(
 
 @app.post("/refresh", response_model=TokenResponse, summary="Обновление токена")
 async def refresh(refresh_token: str, db: Session = Depends(get_db)):
-    """Обновление токена доступа и refresh токена."""
     auth_service = AuthService(db)
     try:
         new_token, new_refresh_token = await auth_service.refresh_token(refresh_token)
@@ -217,10 +254,12 @@ async def request_leave(
     leave_type: str,
     start_date: str,
     end_date: str,
-    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
+    user_id_role: tuple = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    await auth_service._check_subscription_status((db.query(User).filter(User.user_id == user_id).first()).company_id)
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -242,10 +281,12 @@ async def request_leave(
 @app.post("/competitors/monitor", summary="Мониторинг конкурентов")
 async def monitor_competitors(
     urls: list[str],
-    user_id_role: tuple = Depends(get_current_user),  # Исправлено на get_current_user
+    user_id_role: tuple = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    await auth_service._check_subscription_status((db.query(User).filter(User.user_id == user_id).first()).company_id)
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -267,6 +308,8 @@ async def get_promotion_recommendations(
     db: Session = Depends(get_db)
 ):
     user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    await auth_service._check_subscription_status((db.query(User).filter(User.user_id == user_id).first()).company_id)
     async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
         channel = await connection.channel()
         await channel.default_exchange.publish(
@@ -295,7 +338,7 @@ async def get_profile(
 async def update_profile(
     request: UpdateProfileRequest,
     user_id_role: tuple = Depends(get_current_user),
-    csrf_token: str = Header(..., alias="X-CSRF-Token"),  # CSRF проверка перенесена сюда
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
     db: Session = Depends(get_db)
 ):
     user_id, _ = user_id_role
@@ -311,7 +354,6 @@ async def update_profile(
 
 @app.delete("/users/{user_id}", summary="Удаление пользователя")
 async def delete_user(user_id: str, requester_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Удаление пользователя (только для admin или super_admin)."""
     try:
         requester_id, _ = requester_id_role
         auth_service = AuthService(db)
@@ -323,7 +365,6 @@ async def delete_user(user_id: str, requester_id_role: tuple = Depends(get_curre
 
 @app.post("/report", summary="Генерация отчета")
 async def generate_report(request: ReportRequest, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Генерация отчета о регистрации (только super_admin, устаревший метод)."""
     try:
         user_id, _ = user_id_role
         auth_service = AuthService(db)
@@ -344,7 +385,6 @@ async def get_users(db: Session = Depends(get_db), user_id_role: tuple = Depends
 
 @app.get("/superadmin/stats", summary="Статистика для SuperAdmin")
 async def superadmin_stats(period: str, user_id_role: tuple = Depends(get_current_user), db: Session = Depends(get_db)):
-    """Получение статистики для SuperAdmin."""
     user_id, role = user_id_role
     if role != "super_admin":
         raise HTTPException(status_code=403, detail="Требуется роль SuperAdmin")
@@ -375,10 +415,6 @@ async def delete_company(
     csrf_token: str = Header(..., alias="X-CSRF-Token"),
     db: Session = Depends(get_db)
 ):
-    """
-    Удаление компании по company_id вместе со всеми связанными пользователями.
-    Только для пользователей с ролью admin или super_admin.
-    """
     try:
         user_id, role = user_id_role
         auth_service = AuthService(db)
@@ -398,7 +434,6 @@ async def delete_company(
 
 @app.post("/reset-password", summary="Запрос на сброс пароля")
 async def reset_password(request: PasswordResetRequest, db: Session = Depends(get_db)):
-    """Запрос на сброс пароля с отправкой ссылки на email."""
     auth_service = AuthService(db)
     try:
         result = await auth_service.request_password_reset(request.email)
@@ -412,7 +447,6 @@ async def reset_password(request: PasswordResetRequest, db: Session = Depends(ge
 
 @app.post("/reset-password/confirm", summary="Подтверждение сброса пароля")
 async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Session = Depends(get_db)):
-    """Подтверждение сброса пароля с использованием токена и нового пароля."""
     auth_service = AuthService(db)
     try:
         result = await auth_service.confirm_password_reset(request.token, request.new_password)
@@ -423,7 +457,7 @@ async def confirm_reset_password(request: PasswordResetConfirmRequest, db: Sessi
     except Exception as e:
         logger.error(f"Неизвестная ошибка при подтверждении сброса пароля: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось сбросить пароль")
-    
+
 @app.put("/users/{user_id}", summary="Обновление пользователя")
 async def update_user(
     user_id: str,
@@ -432,13 +466,12 @@ async def update_user(
     csrf_token: str = Header(..., alias="X-CSRF-Token"),
     db: Session = Depends(get_db)
 ):
-    """Обновление данных пользователя (email, роль) администратором или super_admin."""
     requester_id, requester_role = user_id_role
     auth_service = AuthService(db)
-    
+
     if not await auth_service.verify_csrf_token(requester_id, csrf_token):
         raise HTTPException(status_code=403, detail="Invalid CSRF token")
-    
+
     try:
         updated_user = await auth_service.update_user(
             user_id=user_id,
@@ -457,7 +490,7 @@ async def update_user(
     except Exception as e:
         logger.error(f"Неизвестная ошибка при обновлении пользователя {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail="Не удалось обновить пользователя")
-    
+
 @app.get("/clients", response_model=list[ClientResponse], summary="Получить список клиентов")
 async def get_clients(
     user_id_role: tuple = Depends(get_current_user),
@@ -492,7 +525,6 @@ async def add_client(
             amount=request.amount,
             description=request.description
         )
-        # Отправка в ai-service через RabbitMQ
         async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
             channel = await connection.channel()
             await channel.default_exchange.publish(
@@ -513,7 +545,6 @@ async def add_client(
         return ClientResponse(**client)
     except AuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.put("/clients/{client_id}", response_model=ClientResponse, summary="Обновить клиента")
 async def update_client(
@@ -558,9 +589,137 @@ async def delete_client(
     except AuthError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+@app.post("/cards/attach", response_model=CardResponse, summary="Прикрепление карты")
+async def attach_card(
+    request: AttachCardRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        card = await auth_service.attach_card(
+            user_id=user_id,
+            company_id=request.company_id,
+            card_number=request.card_number,
+            expiry=request.expiry,
+            cvc=request.cvc
+        )
+        return CardResponse(**card)
+    except AuthError as e:
+        logger.error(f"Ошибка при прикреплении карты: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/cards/detach", summary="Открепление карты")
+async def detach_card(
+    request: DetachCardRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        await auth_service.detach_card(
+            user_id=user_id,
+            company_id=request.company_id,
+            card_id=request.card_id
+        )
+        return {"message": "Карта успешно откреплена"}
+    except AuthError as e:
+        logger.error(f"Ошибка при откреплении карты: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/cards", response_model=List[CardResponse], summary="Получение списка карт компании")
+async def get_cards(
+    user_id_role: tuple = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    if role not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
+    try:
+        cards = await auth_service.get_company_cards(user_id)
+        return [CardResponse(**card) for card in cards]
+    except AuthError as e:
+        logger.error(f"Ошибка при получении списка карт: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/subscription/payments", response_model=List[PaymentHistoryResponse], summary="Получение истории платежей")
+async def get_payment_history(
+    user_id_role: tuple = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    if role not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
+    try:
+        payments = await auth_service.get_payment_history(user_id)
+        return [PaymentHistoryResponse(**payment) for payment in payments]
+    except AuthError as e:
+        logger.error(f"Ошибка при получении истории платежей: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/subscription/initiate", response_model=SubscriptionPaymentResponse, summary="Инициализация платежа подписки")
+async def initiate_subscription_payment(
+    request: SubscriptionPaymentRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    try:
+        result = await auth_service.initiate_subscription_payment(user_id, request.company_id, request.card_id)
+        return SubscriptionPaymentResponse(**result)
+    except AuthError as e:
+        logger.error(f"Ошибка при инициализации платежа: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/subscription/confirm", summary="Подтверждение платежа подписки")
+async def confirm_subscription_payment(
+    request: ConfirmSubscriptionPaymentRequest,
+    db: Session = Depends(get_db)
+):
+    auth_service = AuthService(db)
+    try:
+        result = await auth_service.confirm_subscription_payment(request.payment_id)
+        return result
+    except AuthError as e:
+        logger.error(f"Ошибка при подтверждении платежа: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/subscription/activate-trial", summary="Активация пробного периода")
+async def activate_trial(
+    request: ActivateTrialRequest,
+    user_id_role: tuple = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    user_id, role = user_id_role
+    auth_service = AuthService(db)
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+    if role not in ["admin", "super_admin"]:
+        raise HTTPException(status_code=403, detail="Требуются права admin или super_admin")
+    try:
+        await auth_service.activate_trial(user_id, request.company_id)
+        return {"message": "Пробный период успешно активирован"}
+    except AuthError as e:
+        logger.error(f"Ошибка при активации пробного периода: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 @app.get("/health", summary="Проверка состояния")
 def health_check():
-    """Проверка работоспособности сервиса."""
     return {"status": "healthy"}
 
 @app.on_event("shutdown")
@@ -575,9 +734,8 @@ async def startup_event():
     service = AuthService(db)
     asyncio.create_task(service.rotate_keys_periodically())
 
-    # Добавляем слушателя ai_queue
     async def consume_ai_queue():
-        connection = await aio_pika.connect_robust(Config.RABBITMQ_URL)  # Ожидаем корутину
+        connection = await aio_pika.connect_robust(Config.RABBITMQ_URL)
         async with connection:
             channel = await connection.channel()
             queue = await channel.declare_queue("ai_queue")

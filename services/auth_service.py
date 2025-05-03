@@ -7,7 +7,7 @@ from typing import Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from config import Config
-from models import User, Company, AuditLog, Client
+from models import User, Company, AuditLog, Client, Subscription, SubscriptionStatus, Card
 from passlib.context import CryptContext
 import redis.asyncio as redis
 import asyncio
@@ -17,8 +17,10 @@ from google.auth.transport import requests as google_requests
 from services.queue_service import QueueService
 import aiohttp
 import aio_pika
-import re 
+import re
 import uuid
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 logger = logging.getLogger("auth-service")
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -28,6 +30,9 @@ class AuthError(Exception):
 
 class AuthService:
     MAX_USERS_PER_COMPANY = 8
+    SUBSCRIPTION_AMOUNT = 159  # Стоимость подписки в рублях
+    TRIAL_DAYS = 5  # Длительность пробного периода
+    RECURRENT_PAYMENT_INTERVAL = 30  # Интервал рекуррентного платежа в днях
 
     def __init__(self, db: Session):
         self.db = db
@@ -39,10 +44,15 @@ class AuthService:
         self.lockout_duration = Config.LOCKOUT_DURATION
         self.queue = QueueService()
         self.secret_rotation_window = 3600
+        self.tbank_api_key = Config.TBANK_API_KEY
+        self.tbank_terminal_key = Config.TBANK_TERMINAL_KEY
+        self.scheduler = AsyncIOScheduler()
+        self.scheduler.start()
+        self._schedule_recurrent_payments()
 
     def _generate_service_token(self) -> str:
         return self._generate_token("service", "service", Config.JWT_EXPIRY)
-    
+
     async def rotate_keys_periodically(self):
         while True:
             try:
@@ -55,7 +65,6 @@ class AuthService:
             except Exception as e:
                 logger.error(f"Ошибка при ротации ключей: {str(e)}")
                 await asyncio.sleep(60)
-                
 
     def _hash_password(self, password: str) -> str:
         return pwd_context.hash(password)
@@ -72,21 +81,15 @@ class AuthService:
         return jwt.encode(payload, self.current_secret, algorithm="HS256")
 
     def _verify_token(self, token: str) -> dict:
-        """Проверка токена с учетом текущего и старого ключа, включая кэширование и проверку времени."""
         try:
-            # Проверка черного списка
             if asyncio.run(self.redis.get(f"blacklist:{token}")):
                 raise AuthError("Токен в черном списке")
-
-            # Попытка декодирования с текущим ключом
             payload = jwt.decode(token, self.current_secret, algorithms=["HS256"])
             return payload
         except jwt.JWTError as e:
             if self.old_secret:
                 try:
-                    # Декодирование со старым ключом
                     payload = jwt.decode(token, self.old_secret, algorithms=["HS256"])
-                    # Проверка, не слишком ли старый токен
                     if datetime.utcnow() > datetime.fromtimestamp(payload["exp"]) + timedelta(seconds=self.secret_rotation_window):
                         raise AuthError("Токен слишком старый")
                     return payload
@@ -100,7 +103,6 @@ class AuthService:
         logger.info(f"Аудит: пользователь {user_id} выполнил действие '{action}'")
 
     async def _check_login_attempts(self, email: str) -> bool:
-        """Проверка количества попыток входа."""
         key = f"login_attempts:{email}"
         attempts = await self.redis.get(key)
         if attempts and int(attempts) >= self.max_login_attempts:
@@ -109,7 +111,6 @@ class AuthService:
         return True
 
     async def _increment_login_attempts(self, email: str):
-        """Увеличение счетчика попыток входа."""
         key = f"login_attempts:{email}"
         attempts = await self.redis.get(key)
         if attempts:
@@ -118,12 +119,10 @@ class AuthService:
             await self.redis.set(key, 1, ex=self.lockout_duration)
 
     async def _reset_login_attempts(self, email: str):
-        """Сброс счетчика попыток входа."""
         key = f"login_attempts:{email}"
         await self.redis.delete(key)
 
     async def notify_user(self, user_id: str, method: str, message: str, priority: int = 1) -> None:
-        """Уведомление пользователя через RabbitMQ."""
         async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
             channel = await connection.channel()
             await channel.default_exchange.publish(
@@ -138,15 +137,12 @@ class AuthService:
         logger.info(f"Уведомление отправлено пользователю {user_id}: {message}")
 
     async def register(self, email: str, password: str, phone: str, company_type: str, company_data: Dict) -> Tuple[str, str, str]:
-        """Регистрация пользователя с учетом типа компании, дополнительных проверок и лимита пользователей."""
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Пользователь с таким email уже существует")
 
-        # Валидация телефона
         if not re.match(r"^\+7\(\d{3}\)\s\d{3}-\d{2}-\d{2}$", phone):
             raise AuthError("Неверный формат телефона. Используйте +7(XXX) XXX-XX-XX")
 
-        # Маппинг типов компаний
         company_type_map = {
             "Самозанятый": "self_employed",
             "ИП": "ip",
@@ -154,7 +150,6 @@ class AuthService:
         }
         company_type = company_type_map.get(company_type, company_type)
 
-        # Создание компании
         if company_type == "self_employed":
             inn = company_data.get("inn")
             if inn and (len(inn) != 12 or not inn.isdigit()):
@@ -194,20 +189,17 @@ class AuthService:
         else:
             raise AuthError("Неверный тип компании")
 
-        # Проверка уникальности INN
         if company.inn and self.db.query(Company).filter(Company.inn == company.inn).first():
             raise AuthError("ИНН уже зарегистрирован")
 
         self.db.add(company)
-        self.db.flush()  # Получаем company_id
+        self.db.flush()
 
-        # Проверка лимита пользователей в компании
         user_count = self.db.query(User).filter(User.company_id == company.company_id).count()
         if user_count >= self.MAX_USERS_PER_COMPANY:
-            self.db.rollback()  # Откатываем создание компании
+            self.db.rollback()
             raise AuthError(f"Достигнут лимит пользователей ({self.MAX_USERS_PER_COMPANY}) для этой компании")
 
-        # Создание пользователя
         user = User(
             email=email,
             password_hash=self._hash_password(password),
@@ -215,13 +207,20 @@ class AuthService:
             role="user"
         )
         self.db.add(user)
+
+        subscription = Subscription(
+            company_id=company.company_id,
+            status=SubscriptionStatus.TRIAL,
+            trial_start=func.now(),
+            trial_end=func.now() + timedelta(days=self.TRIAL_DAYS)
+        )
+        self.db.add(subscription)
         self.db.commit()
 
         user_id = str(user.user_id)
         token = self._generate_token(user_id, "user", Config.JWT_EXPIRY)
         refresh_token = self._generate_token(user_id, "user", Config.REFRESH_TOKEN_EXPIRY)
 
-        # Отправка уведомления
         await self.queue.send_notification(user_id, f"Ваш код верификации: {secrets.token_hex(3)}")
 
         async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
@@ -242,36 +241,30 @@ class AuthService:
 
         await self._log_audit(user_id, f"Registered as {company_type}")
         return user_id, token, refresh_token
-    
+
     async def create_user_in_company(self, requester_id: str, company_id: str, email: str, password: str, role: str) -> Tuple[str, str, str]:
-        """Создание нового пользователя в указанной компании с проверкой прав и лимита."""
-        # Проверка прав запросившего пользователя
         requester = self.db.query(User).filter(User.user_id == requester_id).first()
         if not requester:
             raise AuthError("Запросивший пользователь не найден")
         if requester.role != "admin" or requester.company_id != company_id:
             raise AuthError("Только администратор компании может создавать пользователей")
 
-        # Проверка существования компании
         company = self.db.query(Company).filter(Company.company_id == company_id).first()
         if not company:
             raise AuthError("Компания не найдена")
 
-        # Проверка лимита пользователей в компании
         user_count = self.db.query(User).filter(User.company_id == company_id).count()
         if user_count >= self.MAX_USERS_PER_COMPANY:
             raise AuthError(f"Достигнут лимит пользователей ({self.MAX_USERS_PER_COMPANY}) для этой компании")
 
-        # Проверка уникальности email
         if self.db.query(User).filter(User.email == email).first():
             raise AuthError("Пользователь с таким email уже существует")
 
-        # Создание нового пользователя
         user = User(
             email=email,
             password_hash=self._hash_password(password),
             company_id=company_id,
-            role=role if role in ["user", "manager"] else "user"  # Ограничение ролей
+            role=role if role in ["user", "manager"] else "user"
         )
         self.db.add(user)
         self.db.commit()
@@ -280,7 +273,6 @@ class AuthService:
         token = self._generate_token(user_id, user.role, Config.JWT_EXPIRY)
         refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
 
-        # Отправка уведомления новому пользователю
         await self.queue.send_notification(user_id, f"Вы были добавлены в компанию {company.name}. Ваш email: {email}")
 
         await self._log_audit(requester_id, f"Created user {user_id} in company {company_id}")
@@ -308,14 +300,12 @@ class AuthService:
         return user_id, token, refresh_token, csrf_token
 
     async def logout(self, token: str) -> None:
-        """Выход пользователя с добавлением токена в черный список."""
         user_id, _ = self._verify_token(token)
         await self.redis.set(f"blacklist:{token}", "1", ex=Config.JWT_EXPIRY)
         await self._log_audit(user_id, "Logout")
         logger.info("Пользователь вышел")
 
     async def refresh_token(self, refresh_token: str) -> Tuple[str, str]:
-        """Обновление токена доступа."""
         try:
             payload = self._verify_token(refresh_token)
             user_id = payload["sub"]
@@ -332,7 +322,6 @@ class AuthService:
             logger.error(f"Неверный refresh token: {str(e)}")
             raise AuthError("Неверный refresh token")
 
-    # Обновление get_profile для возврата новых полей
     async def get_profile(self, user_id: str, csrf_token: Optional[str] = None) -> Dict:
         if csrf_token:
             if not await self.verify_csrf_token(user_id, csrf_token):
@@ -347,6 +336,9 @@ class AuthService:
             logger.error(f"Профиль не найден для {user_id}")
             raise AuthError("Пользователь не найден")
         company = self.db.query(Company).filter(Company.company_id == user.company_id).first()
+        subscription = self.db.query(Subscription).filter(Subscription.company_id == user.company_id).first()
+        card = self.db.query(Card).filter(Card.company_id == user.company_id).first()
+
         profile = {
             "user_id": str(user.user_id),
             "email": user.email,
@@ -357,14 +349,20 @@ class AuthService:
             "ogrn": company.ogrn,
             "role": user.role,
             "editable": user.role == "admin",
-            "company_id": str(company.company_id)
+            "company_id": str(company.company_id),
+            "subscription_status": subscription.status.value if subscription else "none",
+            "trial_end": subscription.trial_end.isoformat() if subscription and subscription.trial_end else None,
+            "attachedCard": {
+                "card_id": str(card.card_id),
+                "last4": card.last4,
+                "brand": card.brand
+            } if card else None
         }
         ttl = 3600 if user.role == "user" else 300
         await self._cache_profile(user_id, profile, ttl)
         return profile
 
     async def update_profile(self, user_id: str, email: Optional[str] = None, company_name: Optional[str] = None, inn: Optional[str] = None) -> Dict:
-        """Обновление профиля пользователя."""
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user:
             logger.error(f"Не удалось обновить профиль: пользователь {user_id} не найден")
@@ -389,7 +387,6 @@ class AuthService:
         return await self.get_profile(user_id)
 
     async def delete_user(self, user_id: str, requester_id: str) -> None:
-        """Удаление пользователя."""
         requester = self.db.query(User).filter(User.user_id == requester_id).first()
         target = self.db.query(User).filter(User.user_id == user_id).first()
         if not target:
@@ -405,7 +402,6 @@ class AuthService:
         logger.info(f"Пользователь {user_id} удален пользователем {requester_id}")
 
     async def google_login_url(self) -> str:
-        """Генерирует URL для авторизации через Google."""
         state = secrets.token_urlsafe(16)
         await self.redis.set(f"oauth_state:{state}", "1", ex=600)
         google_auth_url = (
@@ -419,10 +415,9 @@ class AuthService:
         return google_auth_url
 
     async def google_callback(self, code: str, state: str) -> Tuple[str, str, str]:
-        """Обрабатывает callback от Google с проверкой уникальности компании."""
         if not await self.redis.get(f"oauth_state:{state}"):
             raise AuthError("Неверный или просроченный state")
-        
+
         token_url = "https://oauth2.googleapis.com/token"
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -454,7 +449,7 @@ class AuthService:
                 company = Company(name=company_name)
                 self.db.add(company)
                 self.db.flush()
-            
+
             user = User(
                 email=email,
                 password_hash="",
@@ -462,10 +457,17 @@ class AuthService:
                 role="user"
             )
             self.db.add(user)
+
+            subscription = Subscription(
+                company_id=company.company_id,
+                status=SubscriptionStatus.TRIAL,
+                trial_start=func.now(),
+                trial_end=func.now() + timedelta(days=self.TRIAL_DAYS)
+            )
+            self.db.add(subscription)
             self.db.commit()
             logger.info(f"Создан новый пользователь через Google: {email}")
-            
-            # Создание онбординг чек-листа через RabbitMQ
+
             await self._create_onboarding(user.user_id)
         else:
             logger.info(f"Существующий пользователь вошел через Google: {email}")
@@ -475,9 +477,8 @@ class AuthService:
         refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
         await self._log_audit(user_id, "Google login")
         return user_id, token, refresh_token
-    
+
     async def _create_onboarding(self, user_id: uuid.UUID):
-        """Отправка запроса на создание онбординг чек-листа."""
         async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
             channel = await connection.channel()
             await channel.default_exchange.publish(
@@ -488,9 +489,7 @@ class AuthService:
             )
         logger.info(f"Запрос на создание онбординга отправлен для {user_id}")
 
-
     async def superadmin_report(self, requester_id: str, period: str) -> Dict:
-        """Генерация отчета для SuperAdmin."""
         requester = self.db.query(User).filter(User.user_id == requester_id).first()
         if not requester or requester.role != "super_admin":
             raise AuthError("Требуется роль SuperAdmin")
@@ -504,13 +503,13 @@ class AuthService:
         stats = {
             "users": self.db.query(User).filter(time_filter).count(),
             "companies": self.db.query(Company).filter(time_filter).count(),
-            "transactions": self.db.query(User).filter(User.role != "super_admin", time_filter).count() * 1000
+            "subscriptions_active": self.db.query(Subscription).filter(Subscription.status == SubscriptionStatus.ACTIVE, time_filter).count(),
+            "subscriptions_trial": self.db.query(Subscription).filter(Subscription.status == SubscriptionStatus.TRIAL, time_filter).count()
         }
         await self._log_audit(requester_id, f"SuperAdmin report generated for {period}")
         return stats
 
     def generate_report(self, requester_id: str, period: str) -> Dict:
-        """Генерация отчета для SuperAdmin (устаревший метод)."""
         requester = self.db.query(User).filter(User.user_id == requester_id).first()
         if not requester or requester.role != "super_admin":
             logger.error(f"Нет прав для {requester_id} на генерацию отчета")
@@ -537,13 +536,11 @@ class AuthService:
         return report
 
     async def generate_csrf_token(self, user_id: str) -> str:
-        """Генерация CSRF-токена."""
         csrf_token = secrets.token_hex(16)
         await self.redis.set(f"csrf:{user_id}", csrf_token, ex=3600)
         return csrf_token
 
     async def verify_csrf_token(self, user_id: str, csrf_token: str) -> bool:
-        """Проверка CSRF-токена."""
         stored_token = await self.redis.get(f"csrf:{user_id}")
         return stored_token == csrf_token
 
@@ -551,7 +548,6 @@ class AuthService:
         await self.redis.set(f"profile:{user_id}", json.dumps(profile), ex=ttl)
 
     async def delete_company(self, requester_id: str, company_id: str):
-        """Удаление компании и всех связанных пользователей."""
         requester = self.db.query(User).filter(User.user_id == requester_id).first()
         if not requester:
             raise AuthError("Пользователь не найден")
@@ -564,74 +560,59 @@ class AuthService:
         if not company:
             raise AuthError("Компания не найдена")
 
-        # Удаление всех пользователей компании
         users = self.db.query(User).filter(User.company_id == company_id).all()
         if not users:
             raise AuthError("Пользователи компании не найдены")
 
         for user in users:
-            # Удаление записей из Redis (если есть)
             await self.redis.delete(f"csrf:{user.user_id}")
             await self.redis.delete(f"login_attempts:{user.user_id}")
-            # Удаление пользователя из базы
             self.db.delete(user)
 
-        # Удаление компании
         self.db.delete(company)
         self.db.commit()
 
         await self._log_audit(requester_id, f"Deleted company {company_id} and all its users")
         logger.info(f"Компания {company_id} и все связанные пользователи удалены пользователем {requester_id}")
 
-        async def update_user(self, user_id: str, requester_id: str, email: str, role: str) -> Dict:
-            """Обновление данных пользователя (email, роль) с проверкой прав и уникальности."""
-            # Проверка существования пользователя, которого обновляют
-            target_user = self.db.query(User).filter(User.user_id == user_id).first()
-            if not target_user:
-                logger.error(f"Пользователь {user_id} не найден для обновления")
-                raise AuthError("Пользователь не найден")
+    async def update_user(self, user_id: str, requester_id: str, email: str, role: str) -> Dict:
+        target_user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not target_user:
+            logger.error(f"Пользователь {user_id} не найден для обновления")
+            raise AuthError("Пользователь не найден")
 
-            # Проверка прав запросившего
-            requester = self.db.query(User).filter(User.user_id == requester_id).first()
-            if not requester:
-                raise AuthError("Запросивший пользователь не найден")
-            
-            if requester.role not in ["admin", "super_admin"]:
-                raise AuthError("Требуются права admin или super_admin")
-            
-            # Ограничение для admin: обновлять можно только пользователей своей компании
-            if requester.role == "admin" and requester.company_id != target_user.company_id:
-                raise AuthError("Вы можете обновлять только пользователей своей компании")
-            
-            # Ограничение для admin: нельзя менять роль на admin или super_admin
-            if requester.role == "admin" and role in ["admin", "super_admin"]:
-                raise AuthError("Администратор не может назначить роль admin или super_admin")
-            
-            # Проверка уникальности email
-            if email != target_user.email and self.db.query(User).filter(User.email == email).first():
-                raise AuthError("Email уже используется другим пользователем")
+        requester = self.db.query(User).filter(User.user_id == requester_id).first()
+        if not requester:
+            raise AuthError("Запросивший пользователь не найден")
 
-            # Обновление данных
-            target_user.email = email
-            target_user.role = role if role in ["user", "manager", "admin"] else target_user.role  # Ограничение ролей
-            
-            self.db.commit()
-            
-            # Очистка кэша профиля
-            await self.redis.delete(f"profile:{user_id}")
-            
-            # Логирование действия
-            await self._log_audit(requester_id, f"Updated user {user_id} (email: {email}, role: {role})")
-            logger.info(f"Пользователь {user_id} обновлён пользователем {requester_id}: email={email}, role={role}")
-            
-            return {
-                "user_id": str(target_user.user_id),
-                "email": target_user.email,
-                "role": target_user.role
-            }
+        if requester.role not in ["admin", "super_admin"]:
+            raise AuthError("Требуются права admin или super_admin")
+
+        if requester.role == "admin" and requester.company_id != target_user.company_id:
+            raise AuthError("Вы можете обновлять только пользователей своей компании")
+
+        if requester.role == "admin" and role in ["admin", "super_admin"]:
+            raise AuthError("Администратор не может назначить роль admin или super_admin")
+
+        if email != target_user.email and self.db.query(User).filter(User.email == email).first():
+            raise AuthError("Email уже используется другим пользователем")
+
+        target_user.email = email
+        target_user.role = role if role in ["user", "manager", "admin"] else target_user.role
+        self.db.commit()
+
+        await self.redis.delete(f"profile:{user_id}")
+
+        await self._log_audit(requester_id, f"Updated user {user_id} (email: {email}, role: {role})")
+        logger.info(f"Пользователь {user_id} обновлён пользователем {requester_id}: email={email}, role={role}")
+
+        return {
+            "user_id": str(target_user.user_id),
+            "email": target_user.email,
+            "role": target_user.role
+        }
 
     async def get_current_user(self, token: str) -> Tuple[str, str]:
-        """Получение текущего пользователя из токена с проверкой черного списка."""
         if await self.redis.get(f"blacklist:{token}"):
             raise AuthError("Токен в черном списке")
         payload = self._verify_token(token)
@@ -647,7 +628,8 @@ class AuthService:
         amount: Optional[int] = None,
         description: Optional[str] = None
     ) -> Dict:
-        """Добавление клиента."""
+        await self._check_subscription_status(company_id)
+
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user or user.company_id != company_id:
             raise AuthError("У вас нет прав добавлять клиентов в эту компанию")
@@ -687,24 +669,20 @@ class AuthService:
         amount_min: Optional[int] = None,
         amount_max: Optional[int] = None
     ) -> list[Dict]:
-        """Получение списка клиентов с фильтрацией по имени и сумме."""
         user = self.db.query(User).filter(User.user_id == user_id).first()
         if not user:
             raise AuthError("Пользователь не найден")
 
         query = self.db.query(Client).filter(Client.company_id == user.company_id)
 
-        # Фильтр по имени (частичное совпадение)
         if name:
             query = query.filter(Client.name.ilike(f"%{name}%"))
 
-        # Фильтр по сумме
         if amount_min is not None:
             query = query.filter(Client.amount >= amount_min)
         if amount_max is not None:
             query = query.filter(Client.amount <= amount_max)
 
-        # Исключение клиентов с amount=None при активных фильтрах по сумме
         if amount_min is not None or amount_max is not None:
             query = query.filter(Client.amount.isnot(None))
 
@@ -735,7 +713,8 @@ class AuthService:
         amount: Optional[int] = None,
         description: Optional[str] = None
     ) -> Dict:
-        """Обновление данных клиента."""
+        await self._check_subscription_status((self.db.query(User).filter(User.user_id == user_id).first()).company_id)
+
         client = self.db.query(Client).filter(Client.client_id == uuid.UUID(client_id)).first()
         if not client:
             raise AuthError("Клиент не найден")
@@ -768,7 +747,8 @@ class AuthService:
         }
 
     async def delete_client(self, client_id: str, user_id: str):
-        """Удаление клиента."""
+        await self._check_subscription_status((self.db.query(User).filter(User.user_id == user_id).first()).company_id)
+
         client = self.db.query(Client).filter(Client.client_id == uuid.UUID(client_id)).first()
         if not client:
             raise AuthError("Клиент не найден")
@@ -782,30 +762,27 @@ class AuthService:
 
         await self._log_audit(user_id, f"Deleted client {client_id}")
         logger.info(f"Клиент {client_id} удалён пользователем {user_id}")
-    
+
     async def request_password_reset(self, email: str):
-        """Запрос на сброс пароля с генерацией токена и отправкой ссылки на email."""
         user = self.db.query(User).filter(User.email == email).first()
         if not user:
             logger.warning(f"Попытка сброса пароля для несуществующего email: {email}")
             raise AuthError("Пользователь с таким email не найден")
-        
+
         reset_token = secrets.token_urlsafe(32)
-        await self.redis.set(f"reset:{reset_token}", user.user_id, ex=3600)  # Токен действителен 1 час
+        await self.redis.set(f"reset:{reset_token}", user.user_id, ex=3600)
         reset_link = f"{Config.APP_URL}/reset-password/confirm?token={reset_token}"
-        
-        # Отправка уведомления через QueueService
+
         await self.queue.send_notification(
             user.user_id,
             f"Для сброса пароля перейдите по ссылке: {reset_link}"
         )
-        
+
         await self._log_audit(user.user_id, f"Password reset requested for {email}")
         logger.info(f"Запрос на сброс пароля отправлен для {email}")
         return {"message": "Ссылка для сброса пароля отправлена на ваш email"}
 
     async def confirm_password_reset(self, reset_token: str, new_password: str) -> Dict:
-        """Подтверждение сброса пароля с одноразовым токеном."""
         user_id = await self.redis.get(f"reset:{reset_token}")
         if not user_id:
             logger.warning(f"Попытка сброса пароля с неверным или просроченным токеном: {reset_token}")
@@ -825,12 +802,266 @@ class AuthService:
 
         await self.redis.set(f"reset_used:{reset_token}", "1", ex=3600)
         await self.redis.delete(f"reset:{reset_token}")
-        
+
         await self._log_audit(user_id, "Password reset completed")
         logger.info(f"Пароль успешно сброшен для пользователя {user.email}")
         return {"message": "Пароль успешно изменен"}
 
+    async def _check_subscription_status(self, company_id: str) -> None:
+        subscription = self.db.query(Subscription).filter(Subscription.company_id == company_id).first()
+        if not subscription:
+            raise AuthError("Подписка не найдена")
+
+        if subscription.status == SubscriptionStatus.TRIAL:
+            if datetime.utcnow() > subscription.trial_end:
+                subscription.status = SubscriptionStatus.EXPIRED
+                self.db.commit()
+                raise AuthError("Пробный период истек. Пожалуйста, оформите подписку.")
+        elif subscription.status != SubscriptionStatus.ACTIVE:
+            raise AuthError("Подписка не активна. Пожалуйста, оформите подписку.")
+
+    async def attach_card(self, user_id: str, company_id: str, card_number: str, expiry: str, cvc: str) -> Dict:
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or user.company_id != company_id:
+            raise AuthError("У вас нет прав для прикрепления карты в этой компании")
+        if user.role != "admin":
+            raise AuthError("Только администратор может прикреплять карту")
+
+        existing_card = self.db.query(Card).filter(Card.company_id == company_id).first()
+        if existing_card:
+            raise AuthError("Карта уже прикреплена. Сначала открепите существующую карту.")
+
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "TerminalKey": self.tbank_terminal_key,
+                "CustomerKey": str(user.user_id),
+                "CardNumber": card_number,
+                "ExpDate": expiry.replace("/", ""),
+                "CardHolder": user.email.split("@")[0],
+                "CVC": cvc
+            }
+            headers = {"Authorization": f"Bearer {self.tbank_api_key}"}
+            async with session.post("https://securepay.tinkoff.ru/v2/AddCard", json=payload, headers=headers) as response:
+                result = await response.json()
+                if not result.get("Success"):
+                    logger.error(f"Ошибка прикрепления карты: {result.get('Message')}")
+                    raise AuthError(f"Ошибка прикрепления карты: {result.get('Message')}")
+
+                last4 = card_number[-4:]
+                brand = result.get("Brand", "Unknown")
+
+                card = Card(
+                    company_id=company_id,
+                    last4=last4,
+                    brand=brand,
+                    tbank_customer_key=str(user.user_id),
+                    tbank_card_id=result.get("CardId")
+                )
+                self.db.add(card)
+                self.db.commit()
+
+                await self._log_audit(user_id, f"Card attached for company {company_id}")
+                logger.info(f"Карта прикреплена для компании {company_id} пользователем {user_id}")
+
+                return {
+                    "card_id": str(card.card_id),
+                    "last4": card.last4,
+                    "brand": card.brand
+                }
+
+    async def detach_card(self, user_id: str, company_id: str, card_id: str) -> None:
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or user.company_id != company_id:
+            raise AuthError("У вас нет прав для открепления карты в этой компании")
+        if user.role != "admin":
+            raise AuthError("Только администратор может откреплять карту")
+
+        card = self.db.query(Card).filter(Card.card_id == uuid.UUID(card_id), Card.company_id == company_id).first()
+        if not card:
+            raise AuthError("Карта не найдена")
+
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "TerminalKey": self.tbank_terminal_key,
+                "CardId": card.tbank_card_id,
+                "CustomerKey": card.tbank_customer_key
+            }
+            headers = {"Authorization": f"Bearer {self.tbank_api_key}"}
+            async with session.post("https://securepay.tinkoff.ru/v2/RemoveCard", json=payload, headers=headers) as response:
+                result = await response.json()
+                if not result.get("Success"):
+                    logger.error(f"Ошибка открепления карты: {result.get('Message')}")
+                    raise AuthError(f"Ошибка открепления карты: {result.get('Message')}")
+
+        subscription = self.db.query(Subscription).filter(Subscription.company_id == company_id).first()
+        if subscription and subscription.recurrent_payment_id:
+            subscription.recurrent_payment_id = None
+            self.db.commit()
+
+        self.db.delete(card)
+        self.db.commit()
+
+        await self._log_audit(user_id, f"Card {card_id} detached for company {company_id}")
+        logger.info(f"Карта {card_id} откреплена для компании {company_id} пользователем {user_id}")
+
+    async def initiate_subscription_payment(self, user_id: str, company_id: str, card_id: Optional[str] = None) -> Dict:
+        user = self.db.query(User).filter(User.user_id == user_id).first()
+        if not user or user.company_id != company_id:
+            raise AuthError("У вас нет прав для оформления подписки в этой компании")
+        if user.role != "admin":
+            raise AuthError("Только администратор может оформлять подписку")
+
+        subscription = self.db.query(Subscription).filter(Subscription.company_id == company_id).first()
+        if not subscription:
+            raise AuthError("Подписка не найдена")
+
+        if subscription.status == SubscriptionStatus.ACTIVE:
+            raise AuthError("Подписка уже активна")
+
+        card = None
+        if card_id:
+            card = self.db.query(Card).filter(Card.card_id == uuid.UUID(card_id), Card.company_id == company_id).first()
+            if not card:
+                raise AuthError("Карта не найдена")
+
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "TerminalKey": self.tbank_terminal_key,
+                "Amount": self.SUBSCRIPTION_AMOUNT * 100,
+                "OrderId": str(uuid.uuid4()),
+                "Description": "Ежемесячная подписка",
+                "Recurrent": "Y",
+                "CustomerKey": str(user.user_id),
+                "Receipt": {
+                    "Email": user.email,
+                    "Taxation": "usn_income",
+                    "Items": [{
+                        "Name": "Подписка на сервис",
+                        "Price": self.SUBSCRIPTION_AMOUNT * 100,
+                        "Quantity": 1,
+                        "Amount": self.SUBSCRIPTION_AMOUNT * 100,
+                        "Tax": "none"
+                    }]
+                }
+            }
+            if card:
+                payload["CardId"] = card.tbank_card_id
+
+            headers = {"Authorization": f"Bearer {self.tbank_api_key}"}
+            async with session.post("https://securepay.tinkoff.ru/v2/Init", json=payload, headers=headers) as response:
+                result = await response.json()
+                if not result.get("Success"):
+                    logger.error(f"Ошибка инициализации платежа: {result.get('Message')}")
+                    raise AuthError(f"Ошибка инициализации платежа: {result.get('Message')}")
+
+                subscription.payment_id = result.get("PaymentId")
+                subscription.recurrent_payment_id = result.get("PaymentId") if card else None
+                self.db.commit()
+
+                return {
+                    "payment_url": result.get("PaymentURL"),
+                    "payment_id": result.get("PaymentId")
+                }
+
+    async def confirm_subscription_payment(self, payment_id: str) -> Dict:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "TerminalKey": self.tbank_terminal_key,
+                "PaymentId": payment_id
+            }
+            headers = {"Authorization": f"Bearer {self.tbank_api_key}"}
+            async with session.post("https://securepay.tinkoff.ru/v2/GetState", json=payload, headers=headers) as response:
+                result = await response.json()
+                if not result.get("Success") or result.get("Status") != "CONFIRMED":
+                    logger.error(f"Ошибка подтверждения платежа: {result.get('Message')}")
+                    raise AuthError("Платеж не подтвержден")
+
+        subscription = self.db.query(Subscription).filter(Subscription.payment_id == payment_id).first()
+        if not subscription:
+            raise AuthError("Подписка не найдена")
+
+        subscription.status = SubscriptionStatus.ACTIVE
+        subscription.last_payment_date = datetime.utcnow()
+        self.db.commit()
+
+        user = self.db.query(User).filter(User.company_id == subscription.company_id).first()
+        await self._log_audit(user.user_id, f"Subscription activated for company {subscription.company_id}")
+        logger.info(f"Подписка активирована для компании {subscription.company_id}")
+        return {"message": "Подписка успешно активирована"}
+
+    async def process_recurrent_payment(self, subscription: Subscription) -> None:
+        if not subscription.recurrent_payment_id:
+            logger.warning(f"Рекуррентный платеж не настроен для подписки {subscription.subscription_id}")
+            return
+
+        card = self.db.query(Card).filter(Card.company_id == subscription.company_id).first()
+        if not card:
+            logger.error(f"Карта не найдена для компании {subscription.company_id}")
+            subscription.status = SubscriptionStatus.EXPIRED
+            self.db.commit()
+            return
+
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "TerminalKey": self.tbank_terminal_key,
+                "PaymentId": subscription.recurrent_payment_id,
+                "RebillId": str(uuid.uuid4()),
+                "Amount": self.SUBSCRIPTION_AMOUNT * 100,
+                "Description": "Рекуррентный платеж за подписку",
+                "Receipt": {
+                    "Email": (self.db.query(User).filter(User.company_id == subscription.company_id).first()).email,
+                    "Taxation": "usn_income",
+                    "Items": [{
+                        "Name": "Подписка на сервис",
+                        "Price": self.SUBSCRIPTION_AMOUNT * 100,
+                        "Quantity": 1,
+                        "Amount": self.SUBSCRIPTION_AMOUNT * 100,
+                        "Tax": "none"
+                    }]
+                }
+            }
+            headers = {"Authorization": f"Bearer {self.tbank_api_key}"}
+            async with session.post("https://securepay.tinkoff.ru/v2/Charge", json=payload, headers=headers) as response:
+                result = await response.json()
+                if not result.get("Success") or result.get("Status") != "CONFIRMED":
+                    logger.error(f"Ошибка рекуррентного платежа: {result.get('Message')}")
+                    subscription.status = SubscriptionStatus.EXPIRED
+                    self.db.commit()
+                    await self.notify_user(
+                        (self.db.query(User).filter(User.company_id == subscription.company_id).first()).user_id,
+                        "email",
+                        "Ошибка рекуррентного платежа. Пожалуйста, проверьте данные карты или прикрепите новую.",
+                        priority=10
+                    )
+                    return
+
+        subscription.last_payment_date = datetime.utcnow()
+        subscription.payment_id = result.get("PaymentId")
+        self.db.commit()
+
+        user = self.db.query(User).filter(User.company_id == subscription.company_id).first()
+        await self._log_audit(user.user_id, f"Recurrent payment processed for company {subscription.company_id}")
+        logger.info(f"Рекуррентный платеж обработан для компании {subscription.company_id}")
+
+    def _schedule_recurrent_payments(self):
+        async def check_recurrent_payments():
+            subscriptions = self.db.query(Subscription).filter(
+                Subscription.status == SubscriptionStatus.ACTIVE,
+                Subscription.recurrent_payment_id.isnot(None)
+            ).all()
+            for subscription in subscriptions:
+                if subscription.last_payment_date and (datetime.utcnow() - subscription.last_payment_date).days >= self.RECURRENT_PAYMENT_INTERVAL:
+                    await self.process_recurrent_payment(subscription)
+
+        self.scheduler.add_job(
+            check_recurrent_payments,
+            trigger=IntervalTrigger(days=1),
+            id="recurrent_payments",
+            replace_existing=True
+        )
+        logger.info("Шедулер рекуррентных платежей запущен")
 
     async def close(self) -> None:
+        self.scheduler.shutdown()
         await self.redis.close()
         self.queue.close()

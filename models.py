@@ -1,12 +1,18 @@
-# auth-service/models.py
-from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float
+from sqlalchemy import Column, String, DateTime, ForeignKey, Integer, Float, Boolean, Enum
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 from sqlalchemy.ext.declarative import declarative_base
 import uuid
 from sqlalchemy.orm import relationship
+import enum
 
 Base = declarative_base()
+
+class SubscriptionStatus(enum.Enum):
+    TRIAL = "trial"
+    ACTIVE = "active"
+    EXPIRED = "expired"
+    CANCELLED = "cancelled"
 
 class Company(Base):
     __tablename__ = "companies"
@@ -18,6 +24,8 @@ class Company(Base):
     ogrnip = Column(String, unique=True)
     users = relationship("User", back_populates="company", cascade="all, delete-orphan")
     clients = relationship("Client", back_populates="company", cascade="all, delete-orphan")
+    subscriptions = relationship("Subscription", back_populates="company", cascade="all, delete-orphan")
+    cards = relationship("Card", back_populates="company", cascade="all, delete-orphan")
 
 class User(Base):
     __tablename__ = "users"
@@ -32,7 +40,7 @@ class Client(Base):
     __tablename__ = "clients"
     client_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.company_id", ondelete="CASCADE"), nullable=False)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=True)  # Изменено на UUID
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=True)
     name = Column(String, nullable=False)
     phone = Column(String)
     email = Column(String)
@@ -49,11 +57,36 @@ class AuditLog(Base):
     action = Column(String, nullable=False)
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
-
 class Payroll(Base):
     __tablename__ = "payroll"
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)  # Изменено на UUID
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=False)
     period = Column(String, nullable=False)
     amount = Column(Float, nullable=False)
     calculated_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    subscription_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id = Column(UUID(as_uuid=True), ForeignKey("companies.company_id", ondelete="CASCADE"), nullable=False)
+    status = Column(Enum(SubscriptionStatus), nullable=False, default=SubscriptionStatus.TRIAL)
+    trial_start = Column(DateTime(timezone=True), server_default=func.now())
+    trial_end = Column(DateTime(timezone=True))
+    payment_id = Column(String, nullable=True)  # ID последнего платежа в Т-Банк
+    recurrent_payment_id = Column(String, nullable=True)  # ID рекуррентного платежа в Т-Банк
+    last_payment_date = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    company = relationship("Company", back_populates="subscriptions")
+
+class Card(Base):
+    __tablename__ = "cards"
+    card_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    company_id = Column(UUID(as_uuid=True), ForeignKey("companies.company_id", ondelete="CASCADE"), nullable=False)
+    last4 = Column(String(4), nullable=False)  # Последние 4 цифры карты
+    brand = Column(String, nullable=False)  # Тип карты (Visa, MasterCard и т.д.)
+    tbank_customer_key = Column(String, nullable=True)  # CustomerKey для рекуррентных платежей
+    tbank_card_id = Column(String, nullable=True)  # ID карты в Т-Банк
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    company = relationship("Company", back_populates="cards")

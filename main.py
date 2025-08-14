@@ -308,64 +308,9 @@ async def request_leave(
         )
     return {"message": f"Запрос на {leave_type} отправлен"}
 
-@app.post("/competitors/monitor", summary="Мониторинг конкурентов")
-async def monitor_competitors(
-    urls: List[str] = Field(..., min_items=1, max_items=10),
-    user_id_role: Tuple[str, str] = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Запуск мониторинга конкурентов."""
-    user_id, _ = user_id_role
-    auth_service = AuthService(db)
-    
-    # Проверяем статус подписки
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if user:
-        await auth_service._check_subscription_status(user.company_id)
-    
-    # Отправляем сообщение в очередь
-    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-        channel = await connection.channel()
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({
-                    "type": "monitor_competitors",
-                    "data": {"user_id": user_id, "urls": urls}
-                }).encode()
-            ),
-            routing_key="ai_queue"
-        )
-    return {"message": "Мониторинг конкурентов запущен"}
+# Удалено: дублирующая функция мониторинга конкурентов перенесена в ai-business-assistant
 
-@app.post("/promotion/recommendations", summary="Рекомендации по продвижению")
-async def get_promotion_recommendations(
-    sales_data: Dict = Field(..., description="Данные о продажах"),
-    competitor_data: Dict = Field(..., description="Данные о конкурентах"),
-    user_id_role: Tuple[str, str] = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """Получение рекомендаций по продвижению."""
-    user_id, _ = user_id_role
-    auth_service = AuthService(db)
-    
-    # Проверяем статус подписки
-    user = db.query(User).filter(User.user_id == user_id).first()
-    if user:
-        await auth_service._check_subscription_status(user.company_id)
-    
-    # Отправляем сообщение в очередь
-    async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-        channel = await connection.channel()
-        await channel.default_exchange.publish(
-            aio_pika.Message(
-                body=json.dumps({
-                    "type": "promotion_recommendations",
-                    "data": {"user_id": user_id, "sales_data": sales_data, "competitor_data": competitor_data}
-                }).encode()
-            ),
-            routing_key="ai_queue"
-        )
-    return {"message": "Запрос на рекомендации отправлен"}
+# Удалено: дублирующая функция рекомендаций по продвижению перенесена в ai-business-assistant
 
 @app.get("/profile", response_model=ProfileResponse, summary="Получение профиля")
 async def get_profile(

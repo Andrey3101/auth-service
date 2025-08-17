@@ -151,6 +151,26 @@ class PaymentHistoryResponse(BaseModel):
 class ActivateTrialRequest(BaseModel):
     company_id: str
 
+class BankConnectionRequest(BaseModel):
+    bank_name: str = Field(..., description="Название банка")
+    account_number: str = Field(..., description="Номер счета")
+    account_type: str = Field(..., description="Тип счета (current, savings, credit)")
+
+class BankAccountResponse(BaseModel):
+    connection_id: str
+    bank_name: str
+    account_number: str
+    account_type: str
+    status: str
+    connected_at: str
+
+class BankConnectionStatusResponse(BaseModel):
+    request_id: str
+    status: str
+    message: str
+    created_at: str
+    updated_at: str
+
 def get_db():
     db = SessionLocal()
     try:
@@ -748,6 +768,112 @@ async def activate_trial(
         return {"message": "Пробный период успешно активирован"}
     except AuthError as e:
         logger.error(f"Ошибка при активации пробного периода: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/bank/connect", summary="Подключение банковского счета")
+async def connect_bank_account(
+    request: BankConnectionRequest,
+    user_id_role: Tuple[str, str] = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    """Подключение банковского счета пользователя."""
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+    
+    try:
+        result = await auth_service.connect_bank_account(
+            user_id=user_id,
+            bank_name=request.bank_name,
+            account_number=request.account_number,
+            account_type=request.account_type
+        )
+        return {"message": "Банковский счет успешно подключен", "connection_id": result}
+    except AuthError as e:
+        logger.error(f"Ошибка подключения банковского счета: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.get("/bank/accounts", summary="Получение подключенных банковских счетов")
+async def get_bank_accounts(
+    user_id_role: Tuple[str, str] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Получение списка подключенных банковских счетов."""
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    
+    try:
+        accounts = await auth_service.get_bank_accounts(user_id)
+        return {"accounts": accounts}
+    except AuthError as e:
+        logger.error(f"Ошибка получения банковских счетов: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.delete("/bank/accounts/{connection_id}", summary="Отключение банковского счета")
+async def disconnect_bank_account(
+    connection_id: str,
+    user_id_role: Tuple[str, str] = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    """Отключение банковского счета."""
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+    
+    try:
+        await auth_service.disconnect_bank_account(user_id, connection_id)
+        return {"message": "Банковский счет успешно отключен"}
+    except AuthError as e:
+        logger.error(f"Ошибка отключения банковского счета: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.post("/bank/request-connection", summary="Запрос на подключение банковского счета")
+async def request_bank_connection(
+    request: BankConnectionRequest,
+    user_id_role: Tuple[str, str] = Depends(get_current_user),
+    csrf_token: str = Header(..., alias="X-CSRF-Token"),
+    db: Session = Depends(get_db)
+):
+    """Отправка запроса в банк для подключения счета."""
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    
+    if not await auth_service.verify_csrf_token(user_id, csrf_token):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid CSRF token")
+    
+    try:
+        result = await auth_service.request_bank_connection(
+            user_id=user_id,
+            bank_name=request.bank_name,
+            account_number=request.account_number,
+            account_type=request.account_type
+        )
+        return {"message": "Запрос на подключение отправлен в банк", "request_id": result}
+    except AuthError as e:
+        logger.error(f"Ошибка отправки запроса в банк: {str(e)}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+@app.get("/bank/connection-status/{request_id}", summary="Статус запроса на подключение")
+async def get_bank_connection_status(
+    request_id: str,
+    user_id_role: Tuple[str, str] = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Получение статуса запроса на подключение банковского счета."""
+    user_id, _ = user_id_role
+    auth_service = AuthService(db)
+    
+    try:
+        status = await auth_service.get_bank_connection_status(user_id, request_id)
+        return {"status": status}
+    except AuthError as e:
+        logger.error(f"Ошибка получения статуса подключения: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 @app.get("/health", summary="Проверка состояния")

@@ -35,6 +35,7 @@ class User(Base):
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.company_id", ondelete="CASCADE"), nullable=False)
     role = Column(String, nullable=False, default="user")
     company = relationship("Company", back_populates="users")
+    cards = relationship("Card", back_populates="user", cascade="all, delete-orphan")  # НОВОЕ: связь с картами
 
 class Client(Base):
     __tablename__ = "clients"
@@ -55,6 +56,7 @@ class AuditLog(Base):
     audit_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     user_id = Column(String, ForeignKey("users.user_id"), nullable=False)
     action = Column(String, nullable=False)
+    details = Column(String, nullable=True)  # НОВОЕ: детали действия в JSON формате
     timestamp = Column(DateTime(timezone=True), server_default=func.now())
 
 class Payroll(Base):
@@ -83,10 +85,19 @@ class Card(Base):
     __tablename__ = "cards"
     card_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     company_id = Column(UUID(as_uuid=True), ForeignKey("companies.company_id", ondelete="CASCADE"), nullable=False)
-    last4 = Column(String(4), nullable=False)  # Последние 4 цифры карты
-    brand = Column(String, nullable=False)  # Тип карты (Visa, MasterCard и т.д.)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.user_id"), nullable=True)  # НОВОЕ: связь с пользователем
+    bank_name = Column(String, nullable=True)  # НОВОЕ: название банка
+    account_number = Column(String, nullable=True)  # НОВОЕ: номер счета
+    account_type = Column(String, nullable=True)  # НОВОЕ: тип счета (current, savings, credit)
+    status = Column(String, default="active")  # НОВОЕ: статус подключения
+    last4 = Column(String(4), nullable=True)  # Последние 4 цифры карты (опционально)
+    brand = Column(String, nullable=True)  # Тип карты (Visa, MasterCard и т.д.) (опционально)
     tbank_customer_key = Column(String, nullable=True)  # CustomerKey для рекуррентных платежей
     tbank_card_id = Column(String, nullable=True)  # ID карты в Т-Банк
+    connected_at = Column(DateTime(timezone=True), nullable=True)  # НОВОЕ: дата подключения
+    disconnected_at = Column(DateTime(timezone=True), nullable=True)  # НОВОЕ: дата отключения
+    connection_requested_at = Column(DateTime(timezone=True), nullable=True)  # НОВОЕ: дата запроса на подключение
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     company = relationship("Company", back_populates="cards")
+    user = relationship("User", back_populates="cards")  # НОВОЕ: связь с пользователем

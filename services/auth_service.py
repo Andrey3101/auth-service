@@ -3,7 +3,7 @@ import jwt
 import json
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple, Optional, List
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from config import Config
@@ -99,8 +99,170 @@ class AuthService:
             logger.error(f"Ошибка проверки токена: {str(e)}")
             raise AuthError("Неверный или просроченный токен")
 
-    async def _log_audit(self, user_id: str, action: str) -> None:
-        logger.info(f"Аудит: пользователь {user_id} выполнил действие '{action}'")
+    async def _log_audit(self, user_id: str, action: str, details: Optional[Dict] = None):
+        """Логирование действий пользователя."""
+        try:
+            audit_log = AuditLog(
+                user_id=user_id,
+                action=action,
+                details=details or {},
+                timestamp=datetime.utcnow()
+            )
+            self.db.add(audit_log)
+            self.db.commit()
+        except Exception as e:
+            logger.error(f"Ошибка логирования аудита: {str(e)}")
+            self.db.rollback()
+
+    # НОВЫЕ МЕТОДЫ ДЛЯ УПРАВЛЕНИЯ БАНКОВСКИМИ СЧЕТАМИ
+    
+    async def connect_bank_account(self, user_id: str, bank_name: str, account_number: str, account_type: str) -> str:
+        """Подключение банковского счета пользователя."""
+        try:
+            # Проверяем, не подключен ли уже этот счет
+            existing_connection = self.db.query(Card).filter(
+                Card.user_id == user_id,
+                Card.bank_name == bank_name,
+                Card.account_number == account_number
+            ).first()
+            
+            if existing_connection:
+                raise AuthError("Этот банковский счет уже подключен")
+            
+            # Создаем новое подключение
+            connection = Card(
+                user_id=user_id,
+                bank_name=bank_name,
+                account_number=account_number,
+                account_type=account_type,
+                status="active",
+                connected_at=datetime.utcnow()
+            )
+            
+            self.db.add(connection)
+            self.db.commit()
+            self.db.refresh(connection)
+            
+            await self._log_audit(user_id, f"Connected bank account {bank_name}:{account_number}")
+            logger.info(f"User {user_id} connected bank account {bank_name}:{account_number}")
+            
+            return str(connection.id)
+            
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Ошибка подключения банковского счета: {str(e)}")
+            raise AuthError(f"Не удалось подключить банковский счет: {str(e)}")
+    
+    async def get_bank_accounts(self, user_id: str) -> List[Dict]:
+        """Получение списка подключенных банковских счетов."""
+        try:
+            accounts = self.db.query(Card).filter(
+                Card.user_id == user_id,
+                Card.status == "active"
+            ).all()
+            
+            return [
+                {
+                    "connection_id": str(account.id),
+                    "bank_name": account.bank_name,
+                    "account_number": account.account_number,
+                    "account_type": account.account_type,
+                    "status": account.status,
+                    "connected_at": account.connected_at.isoformat() if account.connected_at else None
+                }
+                for account in accounts
+            ]
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения банковских счетов: {str(e)}")
+            raise AuthError(f"Не удалось получить банковские счета: {str(e)}")
+    
+    async def disconnect_bank_account(self, user_id: str, connection_id: str) -> None:
+        """Отключение банковского счета."""
+        try:
+            connection = self.db.query(Card).filter(
+                Card.id == connection_id,
+                Card.user_id == user_id
+            ).first()
+            
+            if not connection:
+                raise AuthError("Банковский счет не найден")
+            
+            connection.status = "disconnected"
+            connection.disconnected_at = datetime.utcnow()
+            
+            self.db.commit()
+            
+            await self._log_audit(user_id, f"Disconnected bank account {connection.bank_name}:{connection.account_number}")
+            logger.info(f"User {user_id} disconnected bank account {connection.bank_name}:{connection.account_number}")
+            
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Ошибка отключения банковского счета: {str(e)}")
+            raise AuthError(f"Не удалось отключить банковский счет: {str(e)}")
+    
+    async def request_bank_connection(self, user_id: str, bank_name: str, account_number: str, account_type: str) -> str:
+        """Отправка запроса в банк для подключения счета."""
+        try:
+            # Создаем запрос на подключение
+            connection_request = Card(
+                user_id=user_id,
+                bank_name=bank_name,
+                account_number=account_number,
+                account_type=account_type,
+                status="pending",
+                connection_requested_at=datetime.utcnow()
+            )
+            
+            self.db.add(connection_request)
+            self.db.commit()
+            self.db.refresh(connection_request)
+            
+            # Отправляем запрос в банк через очередь
+            await self.queue.send_message("bank_queue", {
+                "type": "connection_request",
+                "data": {
+                    "request_id": str(connection_request.id),
+                    "user_id": user_id,
+                    "bank_name": bank_name,
+                    "account_number": account_number,
+                    "account_type": account_type
+                }
+            })
+            
+            await self._log_audit(user_id, f"Requested bank connection {bank_name}:{account_number}")
+            logger.info(f"User {user_id} requested bank connection {bank_name}:{account_number}")
+            
+            return str(connection_request.id)
+            
+        except Exception as e:
+            self.db.rollback()
+            logger.error(f"Ошибка отправки запроса в банк: {str(e)}")
+            raise AuthError(f"Не удалось отправить запрос в банк: {str(e)}")
+    
+    async def get_bank_connection_status(self, user_id: str, request_id: str) -> Dict:
+        """Получение статуса запроса на подключение банковского счета."""
+        try:
+            connection_request = self.db.query(Card).filter(
+                Card.id == request_id,
+                Card.user_id == user_id
+            ).first()
+            
+            if not connection_request:
+                raise AuthError("Запрос на подключение не найден")
+            
+            return {
+                "request_id": str(connection_request.id),
+                "status": connection_request.status,
+                "bank_name": connection_request.bank_name,
+                "account_number": connection_request.account_number,
+                "created_at": connection_request.connection_requested_at.isoformat() if connection_request.connection_requested_at else None,
+                "updated_at": connection_request.updated_at.isoformat() if connection_request.updated_at else None
+            }
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения статуса подключения: {str(e)}")
+            raise AuthError(f"Не удалось получить статус подключения: {str(e)}")
 
     async def _check_login_attempts(self, email: str) -> bool:
         key = f"login_attempts:{email}"

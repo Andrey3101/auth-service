@@ -12,12 +12,6 @@ from passlib.context import CryptContext
 import redis.asyncio as redis
 import asyncio
 import secrets
-from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
-from services.queue_service import QueueService
-import aiohttp
-import aio_pika
-import re
 import uuid
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -562,94 +556,6 @@ class AuthService:
         await self.redis.delete(f"profile:{user_id}")
         await self._log_audit(requester_id, f"User {user_id} deleted")
         logger.info(f"Пользователь {user_id} удален пользователем {requester_id}")
-
-    async def google_login_url(self) -> str:
-        state = secrets.token_urlsafe(16)
-        await self.redis.set(f"oauth_state:{state}", "1", ex=600)
-        google_auth_url = (
-            "https://accounts.google.com/o/oauth2/v2/auth?"
-            f"client_id={Config.GOOGLE_CLIENT_ID}&"
-            f"redirect_uri={Config.GOOGLE_REDIRECT_URI}&"
-            "response_type=code&"
-            "scope=openid%20email%20profile"
-            f"state={state}"
-        )
-        return google_auth_url
-
-    async def google_callback(self, code: str, state: str) -> Tuple[str, str, str]:
-        if not await self.redis.get(f"oauth_state:{state}"):
-            raise AuthError("Неверный или просроченный state")
-
-        token_url = "https://oauth2.googleapis.com/token"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                token_url,
-                data={
-                    "code": code,
-                    "client_id": Config.GOOGLE_CLIENT_ID,
-                    "client_secret": Config.GOOGLE_CLIENT_SECRET,
-                    "redirect_uri": Config.GOOGLE_REDIRECT_URI,
-                    "grant_type": "authorization_code",
-                }
-            ) as response:
-                token_data = await response.json()
-                if "id_token" not in token_data:
-                    raise AuthError("Ошибка получения токена от Google")
-
-        id_info = id_token.verify_oauth2_token(
-            token_data["id_token"], google_requests.Request(), Config.GOOGLE_CLIENT_ID
-        )
-        email = id_info["email"]
-
-        user = self.db.query(User).filter(User.email == email).first()
-        if not user:
-            company_name = f"Google User {email.split('@')[0]}"
-            existing_company = self.db.query(Company).filter(Company.name == company_name).first()
-            if existing_company:
-                company = existing_company
-            else:
-                company = Company(name=company_name)
-                self.db.add(company)
-                self.db.flush()
-
-            user = User(
-                email=email,
-                password_hash="",
-                company_id=company.company_id,
-                role="user"
-            )
-            self.db.add(user)
-
-            subscription = Subscription(
-                company_id=company.company_id,
-                status=SubscriptionStatus.TRIAL,
-                trial_start=func.now(),
-                trial_end=func.now() + timedelta(days=self.TRIAL_DAYS)
-            )
-            self.db.add(subscription)
-            self.db.commit()
-            logger.info(f"Создан новый пользователь через Google: {email}")
-
-            await self._create_onboarding(user.user_id)
-        else:
-            logger.info(f"Существующий пользователь вошел через Google: {email}")
-
-        user_id = str(user.user_id)
-        token = self._generate_token(user_id, user.role, Config.JWT_EXPIRY)
-        refresh_token = self._generate_token(user_id, user.role, Config.REFRESH_TOKEN_EXPIRY)
-        await self._log_audit(user_id, "Google login")
-        return user_id, token, refresh_token
-
-    async def _create_onboarding(self, user_id: uuid.UUID):
-        async with aio_pika.connect_robust(Config.RABBITMQ_URL) as connection:
-            channel = await connection.channel()
-            await channel.default_exchange.publish(
-                aio_pika.Message(
-                    body=json.dumps({"type": "create_onboarding", "data": {"user_id": str(user_id)}}).encode()
-                ),
-                routing_key="task_queue"
-            )
-        logger.info(f"Запрос на создание онбординга отправлен для {user_id}")
 
     async def superadmin_report(self, requester_id: str, period: str) -> Dict:
         requester = self.db.query(User).filter(User.user_id == requester_id).first()

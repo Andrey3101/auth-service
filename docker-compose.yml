@@ -2,47 +2,62 @@ version: '3.8'
 
 services:
   auth-service:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    environment:
-      - DB_URL=postgresql://postgres:mysecretpassword@host.docker.internal:5432/postgres
-      - REDIS_URL=redis://redis:6379/0
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - GOOGLE_CLIENT_ID=your-google-client-id
-      - GOOGLE_CLIENT_SECRET=your-google-client-secret
-      - GOOGLE_REDIRECT_URI=http://localhost:8000/auth/google/callback
-      - JWT_SECRET=your-secret-key
+    build: .
     ports:
       - "8000:8000"
+    environment:
+      - DB_URL=postgresql://postgres:password@postgres:5432/auth_service
+      - REDIS_URL=redis://redis:6379
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - JWT_ALGORITHM=HS256
+      - JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - JWT_REFRESH_TOKEN_EXPIRE_DAYS=7
+      - CSRF_SECRET=your-csrf-secret-key
+      - PASSWORD_SALT=your-password-salt
+      - LOG_LEVEL=INFO
+      - DEBUG=False
     depends_on:
+      - postgres
       - redis
       - rabbitmq
     networks:
-      - app-network
+      - helper-network
+
+  postgres:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=auth_service
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - helper-network
 
   redis:
-    image: redis:6
+    image: redis:7-alpine
     ports:
-      - "6379:6379"  # Открываем порт для доступа с хоста (опционально)
+      - "6379:6379"
     networks:
-      - app-network
+      - helper-network
 
   rabbitmq:
     image: rabbitmq:3-management
     ports:
-      - "5673:5673"   # Основной порт RabbitMQ
-      - "15673:15673" # Веб-интерфейс управления
-    healthcheck:
-      test: ["CMD", "rabbitmqctl", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
     networks:
-      - app-network
+      - helper-network
+
+volumes:
+  postgres_data:
 
 networks:
-  app-network:
+  helper-network:
     driver: bridge
-
-# Удаляем volumes, так как postgres_data не используется

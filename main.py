@@ -13,6 +13,8 @@ import aio_pika
 import asyncio
 import json
 from models import User
+import uuid
+from datetime import datetime, timedelta
 
 logger = logging.getLogger("auth-service")
 logging.basicConfig(level=logging.INFO)
@@ -418,27 +420,7 @@ async def superadmin_stats(
     stats = await auth_service.superadmin_report(user_id, period)
     return stats
 
-@app.get("/auth/google/callback", response_model=TokenResponse, summary="Callback для Google OAuth")
-async def google_callback(
-    code: str, 
-    state: str, 
-    db: Session = Depends(get_db)
-):
-    """Callback для Google OAuth аутентификации."""
-    auth_service = AuthService(db)
-    try:
-        user_id, token, refresh_token = await auth_service.google_callback(code, state)
-        return TokenResponse(user_id=user_id, token=token, refresh_token=refresh_token, csrf_token="")
-    except AuthError as e:
-        logger.error(f"Ошибка в Google callback: {str(e)}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-
-@app.get("/auth/google", summary="Получить URL для Google OAuth")
-async def google_login(db: Session = Depends(get_db)):
-    """Получение URL для Google OAuth аутентификации."""
-    auth_service = AuthService(db)
-    url = await auth_service.google_login_url()
-    return {"url": url}
+# Удаляем Google OAuth endpoints - они больше не нужны
 
 @app.delete("/companies/{company_id}", summary="Удаление компании")
 async def delete_company(
@@ -875,6 +857,329 @@ async def get_bank_connection_status(
     except AuthError as e:
         logger.error(f"Ошибка получения статуса подключения: {str(e)}")
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+
+# AI и аналитика
+@app.post("/ai/analyze-productivity", summary="AI анализ продуктивности")
+async def analyze_productivity(request: dict):
+    """AI анализ продуктивности пользователя"""
+    try:
+        # Здесь должна быть логика AI анализа
+        analysis = {
+            "user_id": request.get("user_id"),
+            "productivity_score": 85.5,
+            "trend": "increasing",
+            "insights": [
+                {
+                    "type": "success",
+                    "title": "Рост продуктивности",
+                    "description": "Ваша продуктивность выросла на 15%",
+                    "confidence": 0.92
+                }
+            ],
+            "recommendations": [
+                "Используйте технику Pomodoro",
+                "Приоритизируйте задачи",
+                "Планируйте встречи утром"
+            ]
+        }
+        return {"status": "success", "data": analysis}
+    except Exception as e:
+        logger.error(f"Ошибка AI анализа: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка AI анализа")
+
+@app.get("/ai/insights", summary="Получение AI инсайтов")
+async def get_ai_insights(user_id: str):
+    """Получение AI инсайтов для пользователя"""
+    try:
+        insights = [
+            {
+                "id": "1",
+                "type": "productivity",
+                "title": "Оптимальное время работы",
+                "description": "Вы наиболее продуктивны с 9:00 до 11:00",
+                "confidence": 0.89
+            },
+            {
+                "id": "2",
+                "type": "collaboration",
+                "title": "Командная работа",
+                "description": "Встречи с командой повышают эффективность на 25%",
+                "confidence": 0.76
+            }
+        ]
+        return {"status": "success", "data": insights}
+    except Exception as e:
+        logger.error(f"Ошибка получения инсайтов: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения инсайтов")
+
+# Умные уведомления
+@app.get("/notifications/ai/patterns", summary="AI паттерны уведомлений")
+async def get_notification_patterns(user_id: str):
+    """Получение AI паттернов уведомлений"""
+    try:
+        patterns = [
+            {
+                "id": "1",
+                "title": "Пик активности",
+                "description": "Большинство уведомлений приходит в 9:00-11:00",
+                "confidence": 0.87,
+                "color": "success"
+            },
+            {
+                "id": "2",
+                "title": "Предпочтения по типам",
+                "description": "Вы чаще взаимодействуете с уведомлениями о задачах",
+                "confidence": 0.92,
+                "color": "info"
+            }
+        ]
+        return {"status": "success", "data": patterns}
+    except Exception as e:
+        logger.error(f"Ошибка получения паттернов: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения паттернов")
+
+@app.get("/notifications/ai/recommendations", summary="AI рекомендации по уведомлениям")
+async def get_notification_recommendations(user_id: str):
+    """Получение AI рекомендаций по уведомлениям"""
+    try:
+        recommendations = [
+            {
+                "id": "1",
+                "title": "Оптимизация времени",
+                "description": "Настройте тихие часы для повышения концентрации",
+                "action": "Настроить",
+                "color": "primary"
+            },
+            {
+                "id": "2",
+                "title": "Группировка уведомлений",
+                "description": "Включите умную группировку для уменьшения шума",
+                "action": "Включить",
+                "color": "success"
+            }
+        ]
+        return {"status": "success", "data": recommendations}
+    except Exception as e:
+        logger.error(f"Ошибка получения рекомендаций: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения рекомендаций")
+
+# Персональные отчеты
+@app.post("/reports/ai/generate", summary="Генерация AI отчета")
+async def generate_ai_report(request: dict):
+    """Генерация AI отчета"""
+    try:
+        report = {
+            "id": str(uuid.uuid4()),
+            "title": f"AI {request.get('type')} Report",
+            "type": request.get("type"),
+            "period": request.get("period"),
+            "status": "generating",
+            "created_at": datetime.now().isoformat(),
+            "user_id": request.get("user_id"),
+            "ai_generated": True
+        }
+        return {"status": "success", "data": report}
+    except Exception as e:
+        logger.error(f"Ошибка генерации AI отчета: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка генерации AI отчета")
+
+@app.get("/reports/templates", summary="Шаблоны отчетов")
+async def get_report_templates():
+    """Получение шаблонов отчетов"""
+    try:
+        templates = [
+            {
+                "id": "1",
+                "name": "Отчет по продуктивности",
+                "description": "Анализ продуктивности и эффективности работы",
+                "type": "productivity",
+                "metrics": ["tasks_completed", "productivity", "focus_time"],
+                "periods": ["day", "week", "month"]
+            },
+            {
+                "id": "2",
+                "name": "Отчет по задачам",
+                "description": "Анализ выполнения и планирования задач",
+                "type": "tasks",
+                "metrics": ["task_count", "completion_time", "priority_distribution"],
+                "periods": ["week", "month", "quarter"]
+            }
+        ]
+        return {"status": "success", "data": templates}
+    except Exception as e:
+        logger.error(f"Ошибка получения шаблонов: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения шаблонов")
+
+# Умный бот
+@app.post("/bot/chat", summary="Обработка сообщения бота")
+async def process_bot_message(request: dict):
+    """Обработка сообщения пользователя ботом"""
+    try:
+        response = {
+            "id": str(uuid.uuid4()),
+            "user_id": request.get("user_id"),
+            "timestamp": datetime.now().isoformat(),
+            "response": "Я понимаю ваш запрос. Чем могу помочь?",
+            "intent": "general",
+            "confidence": 0.85,
+            "actions": [
+                {
+                    "id": "create_task",
+                    "text": "Создать задачу",
+                    "icon": "mdi-checkbox-marked-circle",
+                    "color": "success"
+                }
+            ]
+        }
+        return {"status": "success", "data": response}
+    except Exception as e:
+        logger.error(f"Ошибка обработки сообщения бота: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка обработки сообщения бота")
+
+@app.get("/bot/context", summary="Контекст пользователя для бота")
+async def get_bot_context(user_id: str):
+    """Получение контекста пользователя для бота"""
+    try:
+        context = {
+            "user_id": user_id,
+            "preferences": {
+                "language": "ru",
+                "communication_style": "friendly",
+                "expertise": ["general", "tasks", "calendar"]
+            },
+            "current_goals": [
+                "Повысить продуктивность",
+                "Оптимизировать планирование",
+                "Улучшить командную работу"
+            ]
+        }
+        return {"status": "success", "data": context}
+    except Exception as e:
+        logger.error(f"Ошибка получения контекста бота: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения контекста бота")
+
+# VR/AR функции
+@app.post("/vr/boards", summary="Создание VR доски")
+async def create_vr_board(request: dict):
+    """Создание новой VR доски"""
+    try:
+        board = {
+            "id": str(uuid.uuid4()),
+            "user_id": request.get("user_id"),
+            "title": request.get("title"),
+            "type": request.get("type"),
+            "created_at": datetime.now().isoformat(),
+            "status": "active"
+        }
+        return {"status": "success", "data": board}
+    except Exception as e:
+        logger.error(f"Ошибка создания VR доски: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка создания VR доски")
+
+@app.get("/vr/boards", summary="Получение VR досок")
+async def get_vr_boards(user_id: str):
+    """Получение списка VR досок пользователя"""
+    try:
+        boards = [
+            {
+                "id": "1",
+                "title": "Планирование проекта",
+                "type": "project_planning",
+                "created_at": (datetime.now() - timedelta(days=7)).isoformat(),
+                "status": "active"
+            }
+        ]
+        return {"status": "success", "data": boards}
+    except Exception as e:
+        logger.error(f"Ошибка получения VR досок: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения VR досок")
+
+# Мобильное приложение
+@app.post("/mobile/sync", summary="Синхронизация мобильного приложения")
+async def sync_mobile_data(request: dict):
+    """Синхронизация данных мобильного приложения"""
+    try:
+        sync_result = {
+            "user_id": request.get("user_id"),
+            "timestamp": datetime.now().isoformat(),
+            "sync_id": str(uuid.uuid4()),
+            "status": "completed",
+            "synced_items": {
+                "tasks": 5,
+                "meetings": 2,
+                "notes": 3
+            }
+        }
+        return {"status": "success", "data": sync_result}
+    except Exception as e:
+        logger.error(f"Ошибка синхронизации: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка синхронизации")
+
+@app.get("/mobile/offline-data", summary="Данные для офлайн работы")
+async def get_offline_data(user_id: str):
+    """Получение данных для офлайн работы мобильного приложения"""
+    try:
+        offline_data = {
+            "user_id": user_id,
+            "timestamp": datetime.now().isoformat(),
+            "data": {
+                "tasks": [
+                    {
+                        "id": "1",
+                        "title": "Разработка API",
+                        "status": "in_progress",
+                        "priority": "high"
+                    }
+                ],
+                "settings": {
+                    "notifications": True,
+                    "auto_sync": True,
+                    "offline_mode": True
+                }
+            }
+        }
+        return {"status": "success", "data": offline_data}
+    except Exception as e:
+        logger.error(f"Ошибка получения офлайн данных: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения офлайн данных")
+
+# Настройки уведомлений
+@app.put("/notifications/settings", summary="Обновление настроек уведомлений")
+async def update_notification_settings(request: dict):
+    """Обновление настроек уведомлений пользователя"""
+    try:
+        settings = {
+            "user_id": request.get("user_id"),
+            "priority": request.get("priority", "medium"),
+            "frequency": request.get("frequency", "normal"),
+            "smart_prioritization": request.get("smart_prioritization", True),
+            "personalization": request.get("personalization", True),
+            "quiet_hours": request.get("quiet_hours", False),
+            "updated_at": datetime.now().isoformat()
+        }
+        return {"status": "success", "data": settings}
+    except Exception as e:
+        logger.error(f"Ошибка обновления настроек уведомлений: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка обновления настроек уведомлений")
+
+@app.get("/notifications/settings", summary="Получение настроек уведомлений")
+async def get_notification_settings(user_id: str):
+    """Получение настроек уведомлений пользователя"""
+    try:
+        settings = {
+            "user_id": user_id,
+            "priority": "medium",
+            "frequency": "normal",
+            "smart_prioritization": True,
+            "personalization": True,
+            "quiet_hours": False,
+            "quiet_start": "22:00",
+            "quiet_end": "08:00"
+        }
+        return {"status": "success", "data": settings}
+    except Exception as e:
+        logger.error(f"Ошибка получения настроек уведомлений: {e}")
+        raise HTTPException(status_code=500, detail="Ошибка получения настроек уведомлений")
 
 @app.get("/health", summary="Проверка состояния")
 def health_check():

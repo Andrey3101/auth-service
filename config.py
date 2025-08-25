@@ -1,21 +1,34 @@
 import os
+from typing import Optional
 
 class Config:
-    DB_URL = os.getenv("DB_URL", "postgresql://postres:mysecretpassword@localhost:5432/postgres")
-    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    # База данных
+    DB_URL = os.getenv("DB_URL", "postgresql://postgres:password@localhost:5432/auth_service")
+    
+    # Redis
+    REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+    
+    # JWT
+    JWT_SECRET = os.getenv("JWT_SECRET", "your-super-secret-jwt-key-change-in-production")
+    JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+    JWT_ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    JWT_REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+    
+    # RabbitMQ
     RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-    SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
-    JWT_EXPIRY = int(os.getenv("JWT_EXPIRY", "3600"))  # 1 час
-    REFRESH_TOKEN_EXPIRY = int(os.getenv("REFRESH_TOKEN_EXPIRY", "604800"))  # 7 дней
-    JWT_SECRET = "your_initial_secret_key"
-    JWT_EXPIRY = 3600
-    REFRESH_TOKEN_EXPIRY = 604800
-    JWT_ROTATION_INTERVAL = 86400
-    MAX_LOGIN_ATTEMPTS = 5
-    LOCKOUT_DURATION = 900
-    GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "your-google-client-id")
-    GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "your-google-client-secret")
-    GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "http://localhost:8000/auth/google/callback")
-    NOTIFICATION_SERVICE_URL = os.getenv("NOTIFICATION_SERVICE_URL", "http://localhost:8082")
-    TBANK_API_KEY = ''
-    TBANK_TERMINAL_KEY = ''
+    
+    # Сервер
+    HOST = os.getenv("HOST", "0.0.0.0")
+    PORT = int(os.getenv("PORT", "8000"))
+    
+    # Безопасность
+    CSRF_SECRET = os.getenv("CSRF_SECRET", "your-csrf-secret-key")
+    PASSWORD_SALT = os.getenv("PASSWORD_SALT", "your-password-salt")
+    
+    # Логирование
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
+    
+    # Настройки приложения
+    APP_NAME = os.getenv("APP_NAME", "Auth Service")
+    APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
+    DEBUG = os.getenv("DEBUG", "False").lower() == "true"

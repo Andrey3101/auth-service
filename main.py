@@ -21,8 +21,43 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(
     title="Сервис Аутентификации",
-    description="API для управления пользователями, аутентификации, отчетов и уведомлений.",
-    version="1.0.0"
+    description="""
+    ## API для управления пользователями, аутентификации, отчетов и уведомлений
+    
+    ### Основные возможности:
+    - 🔐 Регистрация и аутентификация пользователей
+    - 👥 Управление профилями и ролями
+    - 🏢 Управление компаниями
+    - 📊 Генерация отчетов
+    - 🔄 Управление токенами и сессиями
+    - 📱 Двухфакторная аутентификация
+    - 🎯 Управление подписками
+    
+    ### Аутентификация:
+    Все защищенные эндпоинты требуют JWT токен в заголовке `Authorization: Bearer <token>`
+    """,
+    version="1.0.0",
+    contact={
+        "name": "MSB Support Team",
+        "email": "support@msb-platform.ru",
+        "url": "https://msb-platform.ru"
+    },
+    license_info={
+        "name": "MIT",
+        "url": "https://opensource.org/licenses/MIT"
+    },
+    servers=[
+        {"url": "http://localhost:8001", "description": "Локальная разработка"},
+        {"url": "https://api.msb-platform.ru/auth", "description": "Продакшн"}
+    ],
+    tags=[
+        {"name": "auth", "description": "Аутентификация и авторизация"},
+        {"name": "users", "description": "Управление пользователями"},
+        {"name": "companies", "description": "Управление компаниями"},
+        {"name": "reports", "description": "Генерация отчетов"},
+        {"name": "subscriptions", "description": "Управление подписками"},
+        {"name": "admin", "description": "Административные функции"}
+    ]
 )
 
 engine = create_engine(Config.DB_URL)

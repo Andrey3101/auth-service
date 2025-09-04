@@ -1220,6 +1220,32 @@ async def get_notification_settings(user_id: str):
 def health_check():
     return {"status": "healthy"}
 
+@app.get("/info", summary="Информация о сервисе")
+def get_service_info():
+    """Получение информации о сервисе аутентификации"""
+    return {
+        "service": "Auth Service",
+        "version": "1.0.0",
+        "description": "Сервис аутентификации и авторизации для МСБ",
+        "features": [
+            "JWT аутентификация",
+            "Управление пользователями",
+            "Управление компаниями",
+            "Двухфакторная аутентификация",
+            "Управление подписками",
+            "Интеграция с банками"
+        ],
+        "endpoints": {
+            "auth": "/login, /register, /logout, /refresh",
+            "users": "/users, /profile",
+            "companies": "/companies",
+            "bank": "/bank/*",
+            "reports": "/reports/*"
+        },
+        "status": "running",
+        "timestamp": datetime.now().isoformat()
+    }
+
 @app.on_event("shutdown")
 async def shutdown_event():
     auth_service = AuthService(SessionLocal())
@@ -1255,4 +1281,4 @@ async def startup_event():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8001)

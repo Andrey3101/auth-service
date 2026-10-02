@@ -68,6 +68,7 @@ def user_out(user: User, company: Company) -> UserOut:
         is_active=user.is_active,
         company=company_out(company),
         telegram_linked=user.telegram_chat_id is not None,
+        pd_consent_at=user.pd_consent_at,
         created_at=user.created_at,
     )
 

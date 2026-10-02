@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -126,6 +127,8 @@ async def register(
         position=None,
         role="owner",
         is_active=True,
+        pd_consent_at=datetime.now(timezone.utc),
+        pd_consent_version=settings.pd_consent_version,
     )
     db.add(user)
     db.add(new_trial_subscription(company.id, settings))

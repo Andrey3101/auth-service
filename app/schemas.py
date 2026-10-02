@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic_core import PydanticCustomError
 
 T = TypeVar("T")
 
@@ -11,6 +12,7 @@ Role = Literal["owner", "admin", "user"]
 AssignableRole = Literal["admin", "user"]
 
 INN_PATTERN = r"^(\d{10}|\d{12})$"
+PD_CONSENT_REQUIRED = "Для регистрации необходимо согласие на обработку персональных данных"
 
 
 def _blank_to_none(v: object) -> object:
@@ -48,6 +50,7 @@ class UserOut(BaseModel):
     is_active: bool
     company: CompanyOut
     telegram_linked: bool
+    pd_consent_at: datetime | None
     created_at: datetime
 
 
@@ -94,11 +97,21 @@ class RegisterIn(BaseModel):
     company_name: str = Field(min_length=1, max_length=255)
     company_type: CompanyType
     inn: str | None = Field(None, pattern=INN_PATTERN)
+    # Согласие на обработку ПДн (152-ФЗ): обязательно JSON-значение true.
+    # Отсутствие поля проверяется тем же валидатором (validate_default) — одно понятное сообщение.
+    pd_consent: bool = Field(False, strict=True, validate_default=True)
 
     @field_validator("phone", "inn", mode="before")
     @classmethod
     def _blank(cls, v: object) -> object:
         return _blank_to_none(v)
+
+    @field_validator("pd_consent")
+    @classmethod
+    def _consent_given(cls, v: bool) -> bool:
+        if v is not True:
+            raise PydanticCustomError("pd_consent_required", PD_CONSENT_REQUIRED)
+        return v
 
     @field_validator("full_name", "company_name")
     @classmethod

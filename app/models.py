@@ -36,6 +36,9 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), default="user")  # owner | admin | user
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True)
+    # Согласие на обработку ПДн (152-ФЗ): только при самостоятельной регистрации.
+    pd_consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    pd_consent_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 

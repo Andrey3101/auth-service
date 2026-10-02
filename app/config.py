@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     tbank_api_url: str = Field("https://securepay.tinkoff.ru/v2", alias="TBANK_API_URL")
     tbank_auto_renew: bool = Field(False, alias="TBANK_AUTO_RENEW")
 
+    # Версия текста согласия на обработку ПДн, фиксируется при регистрации (152-ФЗ).
+    pd_consent_version: str = Field("2026-10", alias="PD_CONSENT_VERSION", min_length=1, max_length=32)
+
+    # Сервисы, в которых при удалении компании вызывается очистка данных (раздел 12.5).
+    task_service_url: str = Field("http://task-service:8009", alias="TASK_SERVICE_URL")
+    documents_service_url: str = Field("http://documents-service:8003", alias="DOCUMENTS_SERVICE_URL")
+    financial_service_url: str = Field("http://financial-service:8005", alias="FINANCIAL_SERVICE_URL")
+    notification_service_url: str = Field("http://notification-service:8004", alias="NOTIFICATION_SERVICE_URL")
+
     @field_validator("*", mode="before")
     @classmethod
     def _empty_to_default(cls, v: Any, info: ValidationInfo) -> Any:
@@ -55,7 +64,14 @@ class Settings(BaseSettings):
             raise ValueError("JWT_SECRET должен быть не короче 32 символов")
         return v
 
-    @field_validator("app_url", "tbank_api_url")
+    @field_validator(
+        "app_url",
+        "tbank_api_url",
+        "task_service_url",
+        "documents_service_url",
+        "financial_service_url",
+        "notification_service_url",
+    )
     @classmethod
     def _strip_slash(cls, v: str) -> str:
         return v.rstrip("/")

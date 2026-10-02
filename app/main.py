@@ -10,10 +10,9 @@ from fastapi.responses import JSONResponse
 from redis.exceptions import RedisError
 from sqlalchemy import text
 
-from app import models  # noqa: F401  (регистрация моделей в Base.metadata)
 from app.billing import autorenew_loop
 from app.config import get_settings
-from app.db import Base, engine
+from app.db import engine
 from app.routers import auth, company, internal, subscription, users
 
 settings = get_settings()
@@ -26,9 +25,7 @@ logger = logging.getLogger("auth-service")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
+    # Схема БД управляется Alembic (python -m app.migrate перед запуском uvicorn).
     redis = aioredis.from_url(settings.redis_url, decode_responses=True)
     app.state.redis = redis
 

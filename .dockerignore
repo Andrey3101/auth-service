@@ -1,4 +1,8 @@
-**/__pycache__
-**/.venv
-**/.vs
-**/.vscode
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+tests/
+.pytest_cache/
+*.backup*

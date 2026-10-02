@@ -1,6 +1,8 @@
-**/__pycache__
-**/.venv
-**/.vs
-**/.vscode
-services/**/__pycache__
-services/__pycache__
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
